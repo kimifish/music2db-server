@@ -1,0 +1,16 @@
+[Unit]
+Description=Music2DB Server
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Environment=XDG_CONFIG_HOME=%h/.config
+ExecStart=%h/.local/bin/music2db-server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

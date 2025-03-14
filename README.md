@@ -22,6 +22,8 @@ A FastAPI-based server that provides embedding-based music track indexing and si
 
 ## Installation
 
+### Quick Install (recommended)
+
 1. Clone the repository:
 
     ```bash
@@ -29,13 +31,40 @@ A FastAPI-based server that provides embedding-based music track indexing and si
     cd music2db-server
     ```
 
-2. Install dependencies using UV:
+2. Run the installation script:
 
     ```bash
-    uv venv
-    source .venv/bin/activate  # On Unix-like systems
-    .venv\Scripts\activate     # On Windows
-    uv pip install -r requirements.txt
+    ./install.sh
+    ```
+
+3. Start the service:
+
+    ```bash
+    systemctl --user enable music2db-server
+    systemctl --user start music2db-server
+    ```
+
+### Manual Installation
+
+1. Install the package:
+
+    ```bash
+    pip install -e .
+    ```
+
+2. Create configuration:
+
+    ```bash
+    mkdir -p ~/.config/music2db_server
+    cp config.yaml ~/.config/music2db_server/
+    ```
+
+3. Install systemd service:
+
+    ```bash
+    mkdir -p ~/.config/systemd/user/
+    cp packaging/music2db-server.service ~/.config/systemd/user/
+    systemctl --user daemon-reload
     ```
 
 ## Configuration
