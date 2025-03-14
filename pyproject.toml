@@ -1,0 +1,28 @@
+[project]
+name = "music2db-server"
+version = "0.1.0"
+description = "FastAPI-based server for embedding-based music track indexing and similarity search"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Music2DB Server Contributors" }
+]
+dependencies = [
+    "chromadb-client>=0.6.3",
+    "dotenv>=0.9.9",
+    "fastapi>=0.115.11",
+    "kimiconfig>=0.2.7",
+    "rich>=13.9.4",
+    "sentence-transformers>=3.4.1",
+    "torch",
+    "uvicorn>=0.34.0",
+]
+
+[tool.uv]
+index = [
+    { url = "http://kimihome.lan:58080/simple/" },
+]
+
+[tool.uv.sources]
+torch = { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp310-cp310-linux_x86_64.whl" }

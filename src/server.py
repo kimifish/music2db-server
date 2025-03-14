@@ -1,0 +1,265 @@
+# pyright: basic
+# pyright: reportAttributeAccessIssue=false
+
+import argparse
+import logging
+import os
+import sys
+from typing import Dict, Any
+from dotenv import load_dotenv
+from kimiconfig import Config
+cfg = Config(use_dataclasses=True)
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.pretty import pretty_repr
+from rich.traceback import install as install_rich_traceback 
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+import chromadb
+from typing import Dict, Union
+import uvicorn
+from functools import lru_cache
+
+# Initialize config
+APP_NAME = "music2db_server"
+HOME_DIR = os.path.expanduser("~")
+DEFAULT_CONFIG_FILE = os.path.join(
+    os.getenv("XDG_CONFIG_HOME", os.path.join(HOME_DIR, ".config")), 
+    APP_NAME, 
+    "config.yaml")
+
+load_dotenv()
+
+# Logging setup
+logging.basicConfig(
+    level=logging.NOTSET,
+    format="%(message)s",
+    datefmt="%X",
+    handlers=[RichHandler(console=Console(), markup=True)],
+)
+parent_logger = logging.getLogger(APP_NAME)
+log = logging.getLogger(f"{APP_NAME}.main")
+install_rich_traceback(show_locals=True)
+
+# Initialize FastAPI
+app = FastAPI()
+
+# Model for input JSON validation
+class Track(BaseModel):
+    file_path: str
+    metadata: Dict[str, Union[str, int, bool, float, ]]  # Only strings and integers
+
+app = FastAPI()
+model: SentenceTransformer
+client: chromadb.HttpClient  # type: ignore
+collection: chromadb.Collection
+
+def _init_entities():
+    global app, model, client, collection
+    model = SentenceTransformer(cfg.model.name)
+    client = chromadb.HttpClient(host=cfg.chromadb.host, port=cfg.chromadb.port)
+    collection = client.get_or_create_collection(cfg.chromadb.collection_name)
+
+
+# Function to generate tag string from metadata
+def generate_tag_string(metadata: Dict[str, Union[str, int, bool, float, ]]) -> str:
+    return ", ".join(f"{key}: {value}" for key, value in metadata.items())
+
+
+async def _check_existing_track(file_path: str, metadata: Dict[str, Union[str, int, bool, float, ]]) -> tuple[bool, bool]:
+    """
+    Checks if track exists and compares metadata.
+    
+    Returns:
+        tuple[bool, bool]: (exists, needs_update)
+        - exists: True if record exists
+        - needs_update: True if record exists but metadata differs
+    """
+    existing = collection.get(ids=[file_path])
+    
+    if not existing["ids"]:
+        return False, False
+        
+    existing_metadata = existing["metadatas"][0] # type: ignore
+    
+    # Compare metadata
+    metadata_changed = existing_metadata != metadata
+    
+    return True, metadata_changed
+
+
+# Endpoint for adding a track
+@app.post("/add_track/")
+async def add_track(track: Track):
+    log.debug(f"{track=}")
+    
+    exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
+    
+    if exists and not needs_update:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Track with file_path '{track.file_path}' already exists with same metadata"
+        )
+    
+    if exists and needs_update:
+        # Delete old record
+        collection.delete(ids=[track.file_path])
+        log.info(f"Deleted existing track '{track.file_path}' with different metadata")
+    
+    # Generate tag string
+    tags = generate_tag_string(track.metadata)
+    
+    # Generate embedding on server
+    embedding = model.encode(tags).tolist()
+
+    # Add to ChromaDB
+    collection.add(
+        embeddings=[embedding],
+        metadatas=[track.metadata],
+        ids=[track.file_path]
+    )
+
+    status_msg = "updated" if exists else "added"
+    return {"message": f"Track '{track.file_path}' {status_msg} successfully"}
+
+
+@app.post("/add_tracks/")
+async def add_tracks(tracks: list[Track]):
+    added_count = 0
+    updated_count = 0
+    
+    for track in tracks:
+        exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
+        
+        if exists and not needs_update:
+            continue
+            
+        if exists and needs_update:
+            collection.delete(ids=[track.file_path])
+            updated_count += 1
+            
+        tags = generate_tag_string(track.metadata)
+        embedding = model.encode(tags).tolist()
+        collection.add(
+            embeddings=[embedding],
+            metadatas=[track.metadata],
+            ids=[track.file_path]
+        )
+        
+        if not exists:
+            added_count += 1
+            
+    return {
+        "message": f"Added {added_count} new tracks, updated {updated_count} existing tracks"
+    }
+
+
+# Endpoint for checking list of existing tracks (optional)
+@app.get("/list_tracks/")
+async def list_tracks():
+    all_tracks = collection.get()
+    return {"tracks": all_tracks["ids"]}
+
+
+@app.get("/health/")
+async def health_check():
+    return {"status": "Server is running"}
+
+
+# New endpoint for searching tracks by tag string
+@lru_cache(maxsize=1000)
+def _generate_embedding(tags: str) -> list[float]:
+    return model.encode(tags).tolist()
+
+
+@app.get("/search_tracks/", response_model=list[str])
+async def search_tracks(tags: str, limit: int = 5):
+    """
+    Takes a comma-separated string of tags and returns a list of track paths.
+    :param tags: tag string, e.g. "Linkin Park, Numb, Alternative Rock, Energetic"
+    :param limit: maximum number of tracks to return (default 5)
+    """
+    # Generate embedding for tag string
+    embedding = _generate_embedding(tags)  # Кэшированный вызов
+
+    # Query ChromaDB
+    results = collection.query(
+        query_embeddings=[embedding],
+        n_results=limit
+    )
+
+    # Return list of file paths
+    return results["ids"][0]  # First element is list of IDs (paths)
+
+
+@app.delete("/clear_collection/")
+async def clear_collection():
+    """
+    Deletes all tracks from the collection.
+    Returns the number of deleted tracks.
+    """
+    global collection
+
+    # Get current count of tracks
+    all_tracks = collection.get()
+    count = len(all_tracks["ids"])
+    
+    # Delete all records
+    client.delete_collection(cfg.chromadb.collection_name)
+    collection = client.create_collection(cfg.chromadb.collection_name)
+    
+    log.info(f"Cleared collection '{cfg.chromadb.collection_name}', deleted {count} tracks")
+    return {"message": f"Collection cleared, {count} tracks deleted"}
+
+
+def _init_logs():
+    for logger_name in cfg.logging.loggers.suppress:
+        logging.getLogger(logger_name).setLevel(getattr(logging, cfg.logging.loggers.suppress_level))
+
+    parent_logger.setLevel(cfg.logging.level)
+    if cfg.logging.level == "DEBUG":
+        cfg.print_config()
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Music2DB Server")
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="config_file",
+        default=DEFAULT_CONFIG_FILE,
+        help="Configuration file location.",
+    )
+    return parser.parse_known_args()
+
+
+def _init_config(files: list[str], unknown_args: list[str]):
+    """
+    Initializes the configuration by loading configuration files and passed arguments.
+
+    Args:
+        files (List[str]): List of config files.
+        unknown_args (List[str]): List of arguments (unknown for argparse).
+    """
+    cfg.load_files(files)
+    cfg.load_args(unknown_args)
+
+    # # add some/override config here if needed
+    # cfg.update('runtime.blablabla', True)
+    # cfg.update('religion.buddhism.name', 'Gautama Siddharta')
+
+
+def main():
+    args, unknown_args = _parse_args()
+    _init_config([args.config_file], unknown_args)
+    _init_logs()
+    _init_entities()
+
+    log.info(f"Starting {APP_NAME}")
+    uvicorn.run(app, host=cfg.app.host, port=cfg.app.port)  
+
+
+# Run server
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,21 @@
+app:
+  host: "0.0.0.0"
+  port: 5005
+
+logging:
+  level: "INFO"
+  loggers:
+    suppress:
+      - "httpx"
+      - "httpcore"
+      - "mutagen"
+      - "uvicorn"
+    suppress_level: "WARNING"
+
+model:
+  name: "all-MiniLM-L6-v2"
+
+chromadb:
+  host: "kimihome.lan"
+  port: 8000
+  collection_name: "music_collection"
