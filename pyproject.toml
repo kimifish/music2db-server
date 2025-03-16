@@ -1,10 +1,9 @@
 [project]
 name = "music2db-server"
-version = "0.2.0"
+version = "0.2.3"
 description = "FastAPI-based server for embedding-based music track indexing and similarity search"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
 authors = [
     { name = "Music2DB Server Contributors" }
 ]
@@ -23,11 +22,12 @@ dependencies = [
 music2db-server = "music2db_server.cli:main"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/music2db_server"]
+[tool.setuptools]
+packages = ["music2db_server"]
+package-dir = {"" = "src"}
 
 [tool.uv]
 index = [

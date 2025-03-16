@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import chromadb
+from chromadb.api.types import IncludeEnum
 from typing import Dict, Union
 import uvicorn
 from functools import lru_cache
@@ -63,8 +64,44 @@ def _init_entities():
 
 
 # Function to generate tag string from metadata
-def generate_tag_string(metadata: Dict[str, Union[str, int, bool, float, ]]) -> str:
-    return ", ".join(f"{key}: {value}" for key, value in metadata.items())
+def generate_tag_string(file_path: str, metadata: Dict[str, Union[str, int, bool, float]]) -> str:
+    """
+    Generate a tag string from file path and metadata.
+    Extracts meaningful information from the file path and combines it with metadata.
+    """
+    # Split path into components and clean them
+    path_parts = file_path.replace('\\', '/').split('/')
+    
+    # Extract meaningful parts (artist, album, song)
+    meaningful_parts = []
+    for part in path_parts:
+        # Skip empty parts and common directory names
+        if not part or part.lower() in {'music', 'songs', 'tracks', 'mp3', 'flac'}:
+            continue
+        
+        # Handle "year - album" format
+        if ' - ' in part:
+            year, album = part.split(' - ', 1)
+            if year.isdigit():
+                meaningful_parts.append(album)
+            else:
+                meaningful_parts.append(part)
+        # Handle "number. song" format
+        elif '. ' in part:
+            _, song = part.rsplit('. ', 1)
+            # Remove extension if present
+            song = os.path.splitext(song)[0]
+            meaningful_parts.append(song)
+        else:
+            # Remove extension if present
+            part = os.path.splitext(part)[0]
+            meaningful_parts.append(part)
+    
+    # Combine path information with metadata
+    path_info = ' '.join(meaningful_parts)
+    metadata_str = ', '.join(f"{key}: {value}" for key, value in metadata.items())
+    
+    return f"{path_info} {metadata_str}".strip()
 
 
 async def _check_existing_track(file_path: str, metadata: Dict[str, Union[str, int, bool, float, ]]) -> tuple[bool, bool]:
@@ -107,8 +144,8 @@ async def add_track(track: Track):
         collection.delete(ids=[track.file_path])
         log.info(f"Deleted existing track '{track.file_path}' with different metadata")
     
-    # Generate tag string
-    tags = generate_tag_string(track.metadata)
+    # Generate tag string including file path information
+    tags = generate_tag_string(track.file_path, track.metadata)
     
     # Generate embedding on server
     embedding = model.encode(tags).tolist()
@@ -139,7 +176,7 @@ async def add_tracks(tracks: list[Track]):
             collection.delete(ids=[track.file_path])
             updated_count += 1
             
-        tags = generate_tag_string(track.metadata)
+        tags = generate_tag_string(track.file_path, track.metadata)
         embedding = model.encode(tags).tolist()
         collection.add(
             embeddings=[embedding],
@@ -174,23 +211,33 @@ def _generate_embedding(tags: str) -> list[float]:
 
 
 @app.get("/search_tracks/", response_model=list[str])
-async def search_tracks(tags: str, limit: int = 5):
+async def search_tracks(tags: str, limit: int = 5, max_distance: float = 0.5):
     """
     Takes a comma-separated string of tags and returns a list of track paths.
     :param tags: tag string, e.g. "Linkin Park, Numb, Alternative Rock, Energetic"
     :param limit: maximum number of tracks to return (default 5)
+    :param max_distance: maximum distance to return (default 0.5)
     """
     # Generate embedding for tag string
-    embedding = _generate_embedding(tags)  # Кэшированный вызов
+    embedding = _generate_embedding(tags)
 
-    # Query ChromaDB
+    # Query ChromaDB with increased limit to account for filtering
     results = collection.query(
         query_embeddings=[embedding],
-        n_results=limit
+        n_results=min(limit * 2, 100),  # Request more results but cap at 100
+        include=[IncludeEnum.distances, IncludeEnum.metadatas]
     )
+    log.info(pretty_repr(results))
 
-    # Return list of file paths
-    return results["ids"][0]  # First element is list of IDs (paths)
+    # Filter results by distance
+    filtered_paths = []
+    for path, distance in zip(results["ids"][0], results["distances"][0]): # type: ignore
+        if distance <= max_distance:
+            filtered_paths.append(path)
+        if len(filtered_paths) >= limit:
+            break
+
+    return filtered_paths
 
 
 @app.delete("/clear_collection/")

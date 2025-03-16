@@ -1,7 +1,7 @@
 
 # Music2DB Server
 
-Version: 0.2.0
+Version: 0.2.3
 
 A FastAPI-based server that provides embedding-based music track indexing and similarity search using ChromaDB and Sentence Transformers.
 
