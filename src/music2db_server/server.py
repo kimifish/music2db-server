@@ -22,6 +22,7 @@ from chromadb.api.types import IncludeEnum
 from typing import Dict, Union, List, Optional
 import uvicorn
 from functools import lru_cache
+from music2db_server import __version__
 
 # Initialize config
 APP_NAME = "music2db_server"
@@ -48,7 +49,7 @@ install_rich_traceback(show_locals=True)
 app = FastAPI(
     title="Music2DB Server",
     description="FastAPI-based server for embedding-based music track indexing and similarity search",
-    version="0.2.3",
+    version=__version__,
     docs_url="/docs",
     redoc_url="/redoc",
 )
