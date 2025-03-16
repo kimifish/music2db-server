@@ -260,6 +260,79 @@ async def clear_collection():
     return {"message": f"Collection cleared, {count} tracks deleted"}
 
 
+@app.get("/collection_stats/")
+async def collection_stats():
+    """
+    Get statistics about the collection.
+    Returns:
+        dict: Collection statistics including:
+        - total_tracks: Total number of tracks in collection
+        - total_size: Size of embeddings in MB
+        - metadata_stats: Statistics about metadata fields
+    """
+    # Get all tracks with metadata
+    results = collection.get(
+        include=[IncludeEnum.metadatas, IncludeEnum.embeddings]
+    )
+    
+    if not results["ids"]:
+        return {
+            "total_tracks": 0,
+            "total_size": 0,
+            "metadata_stats": {},
+            "message": "Collection is empty"
+        }
+
+    # Calculate basic stats
+    total_tracks = len(results["ids"])
+    
+    # Calculate embedding size (approximate)
+    # Each embedding is a list of floats (32 bits = 4 bytes each)
+    embedding_dimension = len(results["embeddings"][0]) if isinstance(results["embeddings"][0], list) else results["embeddings"][0].shape[0]  # type: ignore
+    embedding_size = embedding_dimension * 4 * total_tracks / (1024 * 1024)  # Convert to MB
+    
+    # Analyze metadata fields
+    metadata_fields = {}
+    metadatas = results.get("metadatas", [])
+    if not metadatas:
+        return {
+            "total_tracks": total_tracks,
+            "total_size_mb": round(embedding_size, 2),
+            "metadata_stats": {},
+            "embedding_dimensions": embedding_dimension,
+            "message": "No metadata found in collection"
+        }
+
+    for metadata in metadatas:
+        for key, value in metadata.items():
+            if key not in metadata_fields:
+                metadata_fields[key] = {
+                    "count": 0,
+                    "unique_values": set(),
+                    "types": set()
+                }
+            metadata_fields[key]["count"] += 1
+            metadata_fields[key]["unique_values"].add(str(value))
+            metadata_fields[key]["types"].add(type(value).__name__)
+    
+    # Convert sets to lists for JSON serialization
+    metadata_stats = {}
+    for key, stats in metadata_fields.items():
+        metadata_stats[key] = {
+            "count": stats["count"],
+            "coverage_percent": round(stats["count"] / total_tracks * 100, 1),
+            "unique_values_count": len(stats["unique_values"]),
+            "types": list(stats["types"])
+        }
+    
+    return {
+        "total_tracks": total_tracks,
+        "total_size_mb": round(embedding_size, 2),
+        "metadata_stats": metadata_stats,
+        "embedding_dimensions": embedding_dimension
+    }
+
+
 def _init_logs():
     for logger_name in cfg.logging.loggers.suppress:
         logging.getLogger(logger_name).setLevel(getattr(logging, cfg.logging.loggers.suppress_level))
