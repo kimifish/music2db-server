@@ -13,12 +13,13 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.pretty import pretty_repr
 from rich.traceback import install as install_rich_traceback 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.api.types import IncludeEnum
-from typing import Dict, Union
+from typing import Dict, Union, List, Optional
 import uvicorn
 from functools import lru_cache
 
@@ -44,7 +45,13 @@ log = logging.getLogger(f"{APP_NAME}.main")
 install_rich_traceback(show_locals=True)
 
 # Initialize FastAPI
-app = FastAPI()
+app = FastAPI(
+    title="Music2DB Server",
+    description="FastAPI-based server for embedding-based music track indexing and similarity search",
+    version="0.2.3",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
 # Model for input JSON validation
 class Track(BaseModel):
@@ -127,8 +134,35 @@ async def _check_existing_track(file_path: str, metadata: Dict[str, Union[str, i
 
 
 # Endpoint for adding a track
-@app.post("/add_track/")
+@app.post("/add_track/",
+    response_model=dict,
+    summary="Add a single track",
+    response_description="Track addition status")
 async def add_track(track: Track):
+    """
+    Add a single track to the database with its metadata and generate embeddings.
+
+    Parameters:
+    - **file_path**: Full path to the music file
+    - **metadata**: Dictionary containing track metadata
+
+    Example request body:
+    ```json
+    {
+        "file_path": "/music/artist/album/track.mp3",
+        "metadata": {
+            "title": "Song Name",
+            "artist": "Artist Name",
+            "album": "Album Name",
+            "year": 2024,
+            "genre": "Rock"
+        }
+    }
+    ```
+
+    Returns:
+    - **message**: Success or error message
+    """
     log.debug(f"{track=}")
     
     exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
@@ -161,8 +195,34 @@ async def add_track(track: Track):
     return {"message": f"Track '{track.file_path}' {status_msg} successfully"}
 
 
-@app.post("/add_tracks/")
+@app.post("/add_tracks/",
+    response_model=dict,
+    summary="Add multiple tracks",
+    response_description="Batch addition status")
 async def add_tracks(tracks: list[Track]):
+    """
+    Add multiple tracks in a single batch operation.
+
+    Parameters:
+    - **tracks**: List of Track objects containing file_path and metadata
+
+    Example request body:
+    ```json
+    [
+        {
+            "file_path": "/music/track1.mp3",
+            "metadata": { ... }
+        },
+        {
+            "file_path": "/music/track2.mp3",
+            "metadata": { ... }
+        }
+    ]
+    ```
+
+    Returns:
+    - **message**: Summary of added and updated tracks
+    """
     added_count = 0
     updated_count = 0
     
@@ -193,14 +253,32 @@ async def add_tracks(tracks: list[Track]):
 
 
 # Endpoint for checking list of existing tracks (optional)
-@app.get("/list_tracks/")
+@app.get("/list_tracks/",
+    response_model=dict,
+    summary="List all tracks",
+    response_description="List of all track paths")
 async def list_tracks():
+    """
+    Get a list of all track file paths in the collection.
+
+    Returns:
+    - **tracks**: List of file paths
+    """
     all_tracks = collection.get()
     return {"tracks": all_tracks["ids"]}
 
 
-@app.get("/health/")
+@app.get("/health/",
+    response_model=dict,
+    summary="Health check",
+    response_description="Server health status")
 async def health_check():
+    """
+    Check if the server is running and healthy.
+
+    Returns:
+    - **status**: Server status message
+    """
     return {"status": "Server is running"}
 
 
@@ -210,13 +288,52 @@ def _generate_embedding(tags: str) -> list[float]:
     return model.encode(tags).tolist()
 
 
-@app.get("/search_tracks/", response_model=list[str])
-async def search_tracks(tags: str, limit: int = 5, max_distance: float = 0.5):
+class SearchParams(BaseModel):
+    tags: str = Field(..., min_length=1, max_length=200, description="Search query string")
+    limit: int = Field(default=5, ge=1, le=100, description="Maximum number of results")
+    max_distance: float = Field(
+        default=1.2, 
+        ge=0.0, 
+        le=2.0, 
+        description="Maximum cosine distance (0.0 to 2.0)"
+    )
+
+    @field_validator('tags')
+    @classmethod
+    def validate_tags(cls, v: str) -> str:
+        if v.strip() == "":
+            raise ValueError("tags cannot be empty or just whitespace")
+        return v.strip()
+
+
+@app.get("/search_tracks/",
+    response_model=List[str],
+    summary="Search similar tracks",
+    response_description="List of similar track paths")
+async def search_tracks(
+    tags: str = Query(..., description="Search query string (e.g., 'rock upbeat energetic')"),
+    limit: int = Query(default=5, ge=1, le=100, description="Maximum number of results to return"),
+    max_distance: float = Query(
+        default=0.5, 
+        ge=0.0, 
+        le=2.0, 
+        description="Maximum cosine distance for matches (0.0 to 2.0)"
+    )
+):
     """
-    Takes a comma-separated string of tags and returns a list of track paths.
-    :param tags: tag string, e.g. "Linkin Park, Numb, Alternative Rock, Energetic"
-    :param limit: maximum number of tracks to return (default 5)
-    :param max_distance: maximum distance to return (default 0.5)
+    Search for similar tracks using semantic similarity.
+
+    Parameters:
+    - **tags**: Search query string (e.g., "rock upbeat energetic")
+    - **limit**: Maximum number of results to return (1-100, default: 5)
+    - **max_distance**: Maximum cosine distance for matches (0.0-2.0, default: 0.5)
+
+    Returns:
+    - List of file paths to similar tracks
+
+    Raises:
+    - 400: Invalid parameter values
+    - 422: Validation error
     """
     # Generate embedding for tag string
     embedding = _generate_embedding(tags)
@@ -240,11 +357,18 @@ async def search_tracks(tags: str, limit: int = 5, max_distance: float = 0.5):
     return filtered_paths
 
 
-@app.delete("/clear_collection/")
+@app.delete("/clear_collection/",
+    response_model=dict,
+    summary="Clear collection",
+    response_description="Collection clearing status")
 async def clear_collection():
     """
-    Deletes all tracks from the collection.
-    Returns the number of deleted tracks.
+    Delete all tracks from the collection.
+    
+    Warning: This operation cannot be undone.
+
+    Returns:
+    - **message**: Summary of deleted tracks
     """
     global collection
 
@@ -260,15 +384,36 @@ async def clear_collection():
     return {"message": f"Collection cleared, {count} tracks deleted"}
 
 
-@app.get("/collection_stats/")
+@app.get("/collection_stats/",
+    response_model=dict,
+    summary="Get collection statistics",
+    response_description="Database collection statistics")
 async def collection_stats():
     """
-    Get statistics about the collection.
+    Get detailed statistics about the track collection.
+
     Returns:
-        dict: Collection statistics including:
-        - total_tracks: Total number of tracks in collection
-        - total_size: Size of embeddings in MB
-        - metadata_stats: Statistics about metadata fields
+    ```json
+    {
+        "total_tracks": 1000,
+        "total_size_mb": 15.26,
+        "embedding_dimensions": 384,
+        "metadata_stats": {
+            "artist": {
+                "count": 1000,
+                "coverage_percent": 100.0,
+                "unique_values_count": 150,
+                "types": ["str"]
+            },
+            "album": {
+                "count": 950,
+                "coverage_percent": 95.0,
+                "unique_values_count": 200,
+                "types": ["str"]
+            }
+        }
+    }
+    ```
     """
     # Get all tracks with metadata
     results = collection.get(
