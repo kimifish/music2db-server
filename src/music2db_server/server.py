@@ -24,7 +24,7 @@ from functools import lru_cache
 try:
     from music2db_server import __version__
 except ImportError:
-    __version__ = "0.1.0" # Placeholder version
+    __version__ = "0.2.0"
 
 
 # Initialize config
@@ -526,7 +526,7 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
              # Collect the result
              result_item = {
                  "file_path": results_ids[i],
-                 "metadata": results_metadatas[i]
+                 "metadata": results_metadatas[i] if results_metadatas else {},
              }
              filtered_results.append(result_item)
 
@@ -656,9 +656,9 @@ async def collection_stats():
         embedding_size = 0.0
         
         # Check if embeddings exist and are not empty
-        if "embeddings" in sample_results and len(sample_results["embeddings"]) > 0:
+        if "embeddings" in sample_results and len(sample_results["embeddings"]) > 0: # type: ignore
             # Handle both list of floats and numpy array embeddings
-            first_embedding = sample_results["embeddings"][0]
+            first_embedding = sample_results["embeddings"][0] # type: ignore
             if isinstance(first_embedding, list):
                 embedding_dimension = len(first_embedding)
             elif hasattr(first_embedding, 'shape'):  # Check if it's a numpy array or similar
@@ -676,17 +676,18 @@ async def collection_stats():
         # For more accurate metadata stats, you might need to iterate through all metadatas
         # or use aggregation features if ChromaDB supports them efficiently.
         # This sample-based approach gives an estimate.
-        for metadata in metadatas:
-            if metadata: # Ensure metadata is not None or empty
-                for key, value in metadata.items():
-                    if key not in metadata_fields:
-                        metadata_fields[key] = {
-                            "count": 0,
-                            "unique_values": set(),
-                            "types": set()
-                        }
-                    metadata_fields[key]["count"] += 1
-                    # Convert value to string for unique values set to avoid type issues
+        if metadatas is not None:
+            for metadata in metadatas:
+                if metadata: # Ensure metadata is not None or empty
+                    for key, value in metadata.items():
+                        if key not in metadata_fields:
+                            metadata_fields[key] = {
+                                "count": 0,
+                                "unique_values": set(),
+                                "types": set()
+                            }
+                        metadata_fields[key]["count"] += 1
+                        # Convert value to string for unique values set to avoid type issues
                     metadata_fields[key]["unique_values"].add(str(value))
                     metadata_fields[key]["types"].add(type(value).__name__)
 
@@ -739,6 +740,17 @@ async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g
         results = collection.get(
             include=["metadatas"]
         )
+        # Handle case where results might be None (e.g., empty collection)
+        if results is None:
+            results = {"metadatas": []}
+        # Ensure results is a dictionary
+        if not isinstance(results, dict):
+            results = {"metadatas": []}
+        # Ensure 'ids' and 'metadatas' are present
+        if "ids" not in results:
+            results["ids"] = []
+        if "metadatas" not in results:
+            results["metadatas"] = []
 
         if not results["ids"]:
             return {
@@ -749,12 +761,7 @@ async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g
 
         # Extract unique values for the specified key
         unique_values = set()
-        for metadata in results["metadatas"]:
-            if metadata and key in metadata:
-                value = metadata[key]
-                # Convert to string to handle different types consistently
-                unique_values.add(str(value))
-
+        unique_values = {str(metadata[key]) for metadata in results.get("metadatas", []) if metadata and key in metadata}
         # Convert to sorted list for consistent ordering
         values_list = sorted(list(unique_values))
 
@@ -847,4 +854,5 @@ def main():
 
 # Run server
 if __name__ == "__main__":
+    log.info(f"Starting {APP_NAME}")
     sys.exit(main())
