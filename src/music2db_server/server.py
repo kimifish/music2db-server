@@ -12,24 +12,27 @@ cfg = Config(use_dataclasses=True)
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.pretty import pretty_repr
-from rich.traceback import install as install_rich_traceback 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from rich.traceback import install as install_rich_traceback
+from fastapi import FastAPI, HTTPException, Query, Depends # Import Depends
 from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.api.types import IncludeEnum
-from typing import Dict, Union, List, Optional
+from typing import Dict, Union, List, Optional, Literal
 import uvicorn
 from functools import lru_cache
-from music2db_server import __version__
+
+try:
+    from music2db_server import __version__
+except ImportError:
+    __version__ = "0.1.0" # Placeholder version
+
 
 # Initialize config
 APP_NAME = "music2db_server"
 HOME_DIR = os.path.expanduser("~")
 DEFAULT_CONFIG_FILE = os.path.join(
-    os.getenv("XDG_CONFIG_HOME", os.path.join(HOME_DIR, ".config")), 
-    APP_NAME, 
+    os.getenv("XDG_CONFIG_HOME", os.path.join(HOME_DIR, ".config")),
+    APP_NAME,
     "config.yaml")
 
 load_dotenv()
@@ -45,7 +48,12 @@ parent_logger = logging.getLogger(APP_NAME)
 log = logging.getLogger(f"{APP_NAME}.main")
 install_rich_traceback(show_locals=True)
 
+class Track(BaseModel):
+    file_path: str
+    metadata: Dict[str, Union[str, int, bool, float, ]]  # Only strings and integers
+
 # Initialize FastAPI
+# Use only one FastAPI instance
 app = FastAPI(
     title="Music2DB Server",
     description="FastAPI-based server for embedding-based music track indexing and similarity search",
@@ -54,84 +62,90 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Model for input JSON validation
-class Track(BaseModel):
-    file_path: str
-    metadata: Dict[str, Union[str, int, bool, float, ]]  # Only strings and integers
-
-app = FastAPI()
 model: SentenceTransformer
 client: chromadb.HttpClient  # type: ignore
 collection: chromadb.Collection
 
 def _init_entities():
-    global app, model, client, collection
+    """Initializes the SentenceTransformer model and ChromaDB client/collection."""
+    global model, client, collection # Removed 'app' as it's initialized globally
+    # Ensure the model name is correctly configured
+    # Add a check if cfg.model and cfg.model.name exist
+    if not hasattr(cfg, 'model') or not hasattr(cfg.model, 'name'):
+        log.error("Model configuration missing in config.yaml")
+        sys.exit(1)
     model = SentenceTransformer(cfg.model.name)
+
+    # Add a check if cfg.chromadb, cfg.chromadb.host, and cfg.chromadb.port exist
+    if not hasattr(cfg, 'chromadb') or not hasattr(cfg.chromadb, 'host') or not hasattr(cfg.chromadb, 'port'):
+         log.error("ChromaDB configuration missing in config.yaml")
+         sys.exit(1)
+
     client = chromadb.HttpClient(host=cfg.chromadb.host, port=cfg.chromadb.port)
+    # Use get_or_create_collection to ensure it exists
+    # Add a check if cfg.chromadb.collection_name exists
+    if not hasattr(cfg.chromadb, 'collection_name'):
+         log.error("ChromaDB collection name missing in config.yaml")
+         sys.exit(1)
     collection = client.get_or_create_collection(cfg.chromadb.collection_name)
 
 
-# Function to generate tag string from metadata
-def generate_tag_string(file_path: str, metadata: Dict[str, Union[str, int, bool, float]]) -> str:
+# Modified function to generate tag string, focusing on descriptive tags
+def generate_tag_string(file_path: str, metadata: Dict[str, Any]) -> str:
     """
-    Generate a tag string from file path and metadata.
-    Extracts meaningful information from the file path and combines it with metadata.
+    Generate a tag string from metadata, focusing on descriptive tags for embedding.
+    Includes genre and tags from metadata. Optionally includes title/artist if available.
     """
-    # Split path into components and clean them
-    path_parts = file_path.replace('\\', '/').split('/')
-    
-    # Extract meaningful parts (artist, album, song)
-    meaningful_parts = []
-    for part in path_parts:
-        # Skip empty parts and common directory names
-        if not part or part.lower() in {'music', 'songs', 'tracks', 'mp3', 'flac'}:
-            continue
-        
-        # Handle "year - album" format
-        if ' - ' in part:
-            year, album = part.split(' - ', 1)
-            if year.isdigit():
-                meaningful_parts.append(album)
-            else:
-                meaningful_parts.append(part)
-        # Handle "number. song" format
-        elif '. ' in part:
-            _, song = part.rsplit('. ', 1)
-            # Remove extension if present
-            song = os.path.splitext(song)[0]
-            meaningful_parts.append(song)
-        else:
-            # Remove extension if present
-            part = os.path.splitext(part)[0]
-            meaningful_parts.append(part)
-    
-    # Combine path information with metadata
-    path_info = ' '.join(meaningful_parts)
-    metadata_str = ', '.join(f"{key}: {value}" for key, value in metadata.items())
-    
-    return f"{path_info} {metadata_str}".strip()
+    tag_parts = []
+
+    # Include descriptive tags and genre
+    if 'genre' in metadata and isinstance(metadata['genre'], str):
+        tag_parts.append(metadata['genre'])
+    if 'tags' in metadata and isinstance(metadata['tags'], str):
+        # Clean up LastFM tags prefix if present
+        tags_content = metadata['tags'].replace('LastFM tags:', '').strip()
+        if tags_content:
+            tag_parts.append(tags_content)
+
+    # Optionally include title and artist for context in embedding, but they are
+    # also stored separately for exact filtering.
+    if 'title' in metadata and isinstance(metadata['title'], str):
+         tag_parts.append(metadata['title'])
+    if 'artist' in metadata and isinstance(metadata['artist'], str):
+         tag_parts.append(metadata['artist'])
+
+    # Combine parts into a single string
+    return ", ".join(filter(None, tag_parts)).strip()
 
 
-async def _check_existing_track(file_path: str, metadata: Dict[str, Union[str, int, bool, float, ]]) -> tuple[bool, bool]:
+async def _check_existing_track(file_path: str, metadata: Dict[str, Any]) -> tuple[bool, bool]:
     """
     Checks if track exists and compares metadata.
-    
+
     Returns:
         tuple[bool, bool]: (exists, needs_update)
         - exists: True if record exists
         - needs_update: True if record exists but metadata differs
     """
-    existing = collection.get(ids=[file_path])
-    
-    if not existing["ids"]:
-        return False, False
-        
-    existing_metadata = existing["metadatas"][0] # type: ignore
-    
-    # Compare metadata
-    metadata_changed = existing_metadata != metadata
-    
-    return True, metadata_changed
+    # Use try-except for more robust handling of non-existent IDs
+    try:
+        # Use include=[] for efficiency as we only need to check existence and metadata
+        existing = collection.get(ids=[file_path], include=['metadatas'])
+        if not existing["ids"]:
+            return False, False
+
+        existing_metadata = existing["metadatas"][0] # type: ignore
+
+        # Compare metadata. Note: Deep comparison might be needed for complex metadata
+        # For simplicity, a direct comparison is used here.
+        metadata_changed = existing_metadata != metadata
+
+        return True, metadata_changed
+    except Exception as e:
+        log.error(f"Error checking existing track {file_path}: {e}")
+        # Assume it doesn't exist or needs update in case of error
+        # Returning True, True will cause it to be deleted and re-added
+        return False, True
 
 
 # Endpoint for adding a track
@@ -144,8 +158,8 @@ async def add_track(track: Track):
     Add a single track to the database with its metadata and generate embeddings.
 
     Parameters:
-    - **file_path**: Full path to the music file
-    - **metadata**: Dictionary containing track metadata
+    - **file_path**: Full path to the music file (used as ID)
+    - **metadata**: Dictionary containing track metadata (artist, title, album, genre, year, tags, etc.)
 
     Example request body:
     ```json
@@ -156,7 +170,8 @@ async def add_track(track: Track):
             "artist": "Artist Name",
             "album": "Album Name",
             "year": 2024,
-            "genre": "Rock"
+            "genre": "Rock",
+            "tags": "upbeat, energetic, driving"
         }
     }
     ```
@@ -164,36 +179,54 @@ async def add_track(track: Track):
     Returns:
     - **message**: Success or error message
     """
-    log.debug(f"{track=}")
-    
-    exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
-    
-    if exists and not needs_update:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Track with file_path '{track.file_path}' already exists with same metadata"
+    log.info(f"Adding track: {track.file_path}")
+
+    try:
+        exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
+
+        if exists and not needs_update:
+            log.info(f"Track '{track.file_path}' already exists with same metadata, skipping.")
+            return {"message": f"Track '{track.file_path}' already exists with same metadata"}
+
+        if exists and needs_update:
+            # Delete old record before adding the new one
+            collection.delete(ids=[track.file_path])
+            log.info(f"Deleted existing track '{track.file_path}' with different metadata for update.")
+
+        # Generate tag string focusing on descriptive elements for embedding
+        tags_for_embedding = generate_tag_string(track.file_path, track.metadata)
+
+        # Generate embedding on server
+        # Ensure the input to encode is not empty if no descriptive tags are found
+        if not tags_for_embedding:
+             log.warning(f"No descriptive tags found for '{track.file_path}', using file path for embedding.")
+             tags_for_embedding = track.file_path # Fallback to file path if no descriptive tags
+
+        # Add a check for empty tags_for_embedding even after fallback
+        if not tags_for_embedding:
+             log.error(f"Could not generate embedding string for '{track.file_path}'. Skipping.")
+             raise HTTPException(status_code=400, detail=f"Could not generate embedding string for '{track.file_path}'")
+
+
+        embedding = model.encode(tags_for_embedding).tolist()
+
+        # Add to ChromaDB. Store full metadata for filtering.
+        collection.add(
+            embeddings=[embedding],
+            metadatas=[track.metadata], # Store the original, full metadata
+            ids=[track.file_path]
         )
-    
-    if exists and needs_update:
-        # Delete old record
-        collection.delete(ids=[track.file_path])
-        log.info(f"Deleted existing track '{track.file_path}' with different metadata")
-    
-    # Generate tag string including file path information
-    tags = generate_tag_string(track.file_path, track.metadata)
-    
-    # Generate embedding on server
-    embedding = model.encode(tags).tolist()
 
-    # Add to ChromaDB
-    collection.add(
-        embeddings=[embedding],
-        metadatas=[track.metadata],
-        ids=[track.file_path]
-    )
+        status_msg = "updated" if exists else "added"
+        log.info(f"Track '{track.file_path}' {status_msg} successfully.")
+        return {"message": f"Track '{track.file_path}' {status_msg} successfully"}
 
-    status_msg = "updated" if exists else "added"
-    return {"message": f"Track '{track.file_path}' {status_msg} successfully"}
+    except Exception as e:
+        log.error(f"Error adding track '{track.file_path}': {e}")
+        # Return a more specific error if it's an HTTPException already
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Error adding track: {e}")
 
 
 @app.post("/add_tracks/",
@@ -203,6 +236,9 @@ async def add_track(track: Track):
 async def add_tracks(tracks: list[Track]):
     """
     Add multiple tracks in a single batch operation.
+    This implementation processes tracks sequentially, checking and adding/updating each.
+    For true batching with ChromaDB's add method, you would collect
+    all embeddings, metadatas, and ids first before calling collection.add() once.
 
     Parameters:
     - **tracks**: List of Track objects containing file_path and metadata
@@ -224,33 +260,81 @@ async def add_tracks(tracks: list[Track]):
     Returns:
     - **message**: Summary of added and updated tracks
     """
+    log.info(f"Adding batch of {len(tracks)} tracks")
+
     added_count = 0
     updated_count = 0
-    
+    skipped_count = 0
+    errors = []
+
+    # Prepare lists for batching (optional, current implementation is sequential)
+    # batch_embeddings = []
+    # batch_metadatas = []
+    # batch_ids = []
+    # tracks_to_delete = []
+
     for track in tracks:
-        exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
-        
-        if exists and not needs_update:
-            continue
-            
-        if exists and needs_update:
-            collection.delete(ids=[track.file_path])
-            updated_count += 1
-            
-        tags = generate_tag_string(track.file_path, track.metadata)
-        embedding = model.encode(tags).tolist()
-        collection.add(
-            embeddings=[embedding],
-            metadatas=[track.metadata],
-            ids=[track.file_path]
-        )
-        
-        if not exists:
-            added_count += 1
-            
-    return {
-        "message": f"Added {added_count} new tracks, updated {updated_count} existing tracks"
-    }
+        try:
+            exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
+
+            if exists and not needs_update:
+                skipped_count += 1
+                continue
+
+            if exists and needs_update:
+                # Collect IDs for batch deletion before adding
+                # tracks_to_delete.append(track.file_path)
+                # For sequential processing, delete immediately
+                collection.delete(ids=[track.file_path])
+                updated_count += 1
+                log.info(f"Deleted existing track '{track.file_path}' for batch update.")
+
+            tags_for_embedding = generate_tag_string(track.file_path, track.metadata)
+            if not tags_for_embedding:
+                 log.warning(f"No descriptive tags found for '{track.file_path}' in batch, using file path for embedding.")
+                 tags_for_embedding = track.file_path # Fallback
+
+            # Add a check for empty tags_for_embedding even after fallback
+            if not tags_for_embedding:
+                 log.error(f"Could not generate embedding string for '{track.file_path}' in batch. Skipping.")
+                 errors.append({"file_path": track.file_path, "error": "Could not generate embedding string"})
+                 continue
+
+
+            embedding = model.encode(tags_for_embedding).tolist()
+
+            # Collect data for batch adding (if implementing batch add)
+            # batch_embeddings.append(embedding)
+            # batch_metadatas.append(track.metadata)
+            # batch_ids.append(track.file_path)
+
+            # For sequential processing, add immediately
+            collection.add(
+                embeddings=[embedding],
+                metadatas=[track.metadata],
+                ids=[track.file_path]
+            )
+
+            if not exists:
+                added_count += 1
+
+        except Exception as e:
+            log.error(f"Error processing track '{track.file_path}' in batch: {e}")
+            errors.append({"file_path": track.file_path, "error": str(e)})
+
+    # If implementing batch add and delete:
+    # if tracks_to_delete:
+    #     collection.delete(ids=tracks_to_delete)
+    # if batch_ids:
+    #     collection.add(embeddings=batch_embeddings, metadatas=batch_metadatas, ids=batch_ids)
+
+    message = f"Batch process finished: Added {added_count} new tracks, updated {updated_count} existing tracks, skipped {skipped_count} tracks."
+    if errors:
+        message += f" Encountered {len(errors)} errors."
+        # You might want to return the list of errors as well
+        # return {"message": message, "errors": errors}
+
+    return {"message": message}
 
 
 # Endpoint for checking list of existing tracks (optional)
@@ -265,8 +349,15 @@ async def list_tracks():
     Returns:
     - **tracks**: List of file paths
     """
-    all_tracks = collection.get()
-    return {"tracks": all_tracks["ids"]}
+    log.info("Listing all tracks")
+
+    try:
+        # Fetch only IDs to be efficient
+        all_tracks = collection.get(include=[])
+        return {"tracks": all_tracks["ids"]}
+    except Exception as e:
+        log.error(f"Error listing tracks: {e}")
+        raise HTTPException(status_code=500, detail=f"Error listing tracks: {e}")
 
 
 @app.get("/health/",
@@ -280,82 +371,178 @@ async def health_check():
     Returns:
     - **status**: Server status message
     """
-    return {"status": "Server is running"}
+    log.info("Health check requested")
+
+    # You could add checks for ChromaDB connection here
+    try:
+        client.heartbeat()
+        chromadb_status = "ok"
+    except Exception:
+        chromadb_status = "error"
+
+    return {"status": "Server is running", "chromadb": chromadb_status}
 
 
-# New endpoint for searching tracks by tag string
+# New endpoint for searching tracks by tag string with metadata filtering
 @lru_cache(maxsize=1000)
 def _generate_embedding(tags: str) -> list[float]:
-    return model.encode(tags).tolist()
+    """Generates embedding for a given tag string using the SentenceTransformer model."""
+    # Add error handling for encoding
+    try:
+        return model.encode(tags).tolist()
+    except Exception as e:
+        log.error(f"Error generating embedding for tags '{tags}': {e}")
+        # Return a zero vector or raise an error depending on desired behavior
+        # Returning a zero vector might affect search results, raising an error
+        # would prevent the search. Let's raise an error for clarity.
+        raise RuntimeError(f"Failed to generate embedding: {e}")
 
 
 class SearchParams(BaseModel):
-    tags: str = Field(..., min_length=1, max_length=200, description="Search query string")
+    """Parameters for the track search endpoint."""
+    tags: str = Field(
+        default="", # Make tags optional for metadata-only search
+        max_length=200,
+        description="Search query string for semantic search (e.g., 'rock upbeat energetic'). Empty for metadata-only search."
+    )
     limit: int = Field(default=5, ge=1, le=100, description="Maximum number of results")
     max_distance: float = Field(
-        default=1.2, 
-        ge=0.0, 
-        le=2.0, 
-        description="Maximum cosine distance (0.0 to 2.0)"
+        default=0.7, # Adjusted default max_distance, may need tuning
+        ge=0.0,
+        le=2.0,
+        description="Maximum cosine distance for semantic matches (0.0 to 2.0). Only applies if 'tags' is provided."
     )
+    # Optional metadata filters. Use Optional and None as default for flexibility.
+    artist: Optional[str] = Field(default=None, description="Filter by artist name")
+    album: Optional[str] = Field(default=None, description="Filter by album name")
+    genre: Optional[str] = Field(default=None, description="Filter by genre")
+    year: Optional[Union[int, str]] = Field(default=None, description="Filter by year")
+    # Add other metadata fields you might want to filter by
 
-    @field_validator('tags')
-    @classmethod
-    def validate_tags(cls, v: str) -> str:
-        if v.strip() == "":
-            raise ValueError("tags cannot be empty or just whitespace")
-        return v.strip()
+    # No need for a validator for 'tags' if it's optional now
 
 
 @app.get("/search_tracks/",
-    response_model=List[str],
-    summary="Search similar tracks",
-    response_description="List of similar track paths")
-async def search_tracks(
-    tags: str = Query(..., description="Search query string (e.g., 'rock upbeat energetic')"),
-    limit: int = Query(default=5, ge=1, le=100, description="Maximum number of results to return"),
-    max_distance: float = Query(
-        default=0.5, 
-        ge=0.0, 
-        le=2.0, 
-        description="Maximum cosine distance for matches (0.0 to 2.0)"
-    )
-):
+    response_model=List[Dict[str, Any]], # Return full metadata for results
+    summary="Search similar tracks with optional metadata filtering",
+    response_description="List of similar track paths and their metadata")
+async def search_tracks(params: SearchParams = Depends()): # Use Depends to inject SearchParams
     """
-    Search for similar tracks using semantic similarity.
+    Search for similar tracks using semantic similarity and/or filter by metadata.
 
     Parameters:
-    - **tags**: Search query string (e.g., "rock upbeat energetic")
-    - **limit**: Maximum number of results to return (1-100, default: 5)
-    - **max_distance**: Maximum cosine distance for matches (0.0-2.0, default: 0.5)
+    - **tags**: Search query string for semantic search (e.g., "rock upbeat energetic"). Optional.
+    - **limit**: Maximum number of results to return (1-100, default: 5).
+    - **max_distance**: Maximum cosine distance for semantic matches (0.0-2.0, default: 0.7). Only applies if 'tags' is provided.
+    - **artist**: Optional filter by artist name.
+    - **album**: Optional filter by album name.
+    - **genre**: Optional filter by genre.
+    - **year**: Optional filter by year.
+    - Add other optional metadata filter parameters as needed.
 
     Returns:
-    - List of file paths to similar tracks
+    - List of dictionaries, each containing the file path and metadata of a matching track.
 
     Raises:
     - 400: Invalid parameter values
     - 422: Validation error
+    - 500: Internal server error
     """
-    # Generate embedding for tag string
-    embedding = _generate_embedding(tags)
+    log.debug(f"Search query params: {params}")
 
-    # Query ChromaDB with increased limit to account for filtering
-    results = collection.query(
-        query_embeddings=[embedding],
-        n_results=min(limit * 2, 100),  # Request more results but cap at 100
-        include=[IncludeEnum.distances, IncludeEnum.metadatas]
-    )
-    log.info(pretty_repr(results))
+    # Build the where clause for metadata filtering
+    where_clause = {}
+    if params.artist is not None:
+        where_clause["artist"] = params.artist
+    if params.album is not None:
+        where_clause["album"] = params.album
+    if params.genre is not None:
+        where_clause["genre"] = params.genre
+    if params.year is not None:
+        # ChromaDB metadata filtering requires exact match for numbers/strings
+        # Ensure year is stored as string if filtering this way
+        where_clause["year"] = str(params.year)
+        # If you need range queries on year, you might need to store it differently
+        # or handle it outside of the simple where clause.
 
-    # Filter results by distance
-    filtered_paths = []
-    for path, distance in zip(results["ids"][0], results["distances"][0]): # type: ignore
-        if distance <= max_distance:
-            filtered_paths.append(path)
-        if len(filtered_paths) >= limit:
-            break
+    # Add other metadata filters here as needed
 
-    return filtered_paths
+    # Perform the query
+    try:
+        if params.tags:
+            # Semantic search with optional metadata filtering
+            embedding = _generate_embedding(params.tags)
+            raw_results = collection.query(
+                query_embeddings=[embedding],
+                n_results=min(params.limit * 5, 100), # Request more results to filter by distance and metadata
+                include=["distances", "metadatas"],
+                where=where_clause if where_clause else None # Apply metadata filter if not empty
+            )
+            # Normalize the structure for easier processing
+            if raw_results and raw_results.get("ids") and raw_results["ids"]:
+                 results_ids = raw_results["ids"][0]
+                 results_metadatas = raw_results.get("metadatas", [[]])[0] # type: ignore
+                 results_distances = raw_results["distances"][0] # type: ignore
+            else:
+                 results_ids = []
+                 results_metadatas = []
+                 results_distances = [] # Keep empty list for consistency
+
+        elif where_clause:
+            # Metadata-only search
+            raw_results = collection.get(
+                where=where_clause,
+                limit=params.limit, # Apply limit directly for get
+                include=["metadatas"]
+            )
+            # Normalize the structure and add dummy distances
+            if raw_results and raw_results.get("ids") and raw_results["ids"]:
+                results_ids = raw_results["ids"]
+                results_metadatas = raw_results["metadatas"]
+                results_distances = [0.0] * len(results_ids) # Dummy distances for metadata-only search
+            else:
+                results_ids = []
+                results_metadatas = []
+                results_distances = [] # Keep empty list for consistency
+
+        else:
+            # No tags and no metadata filters
+            raise HTTPException(status_code=400, detail="Either 'tags' or at least one metadata filter must be provided.")
+
+        log.info(f"Raw search results count: {len(results_ids)}")
+        # log.debug(f"Raw search results: {pretty_repr(raw_results)}") # Avoid logging potentially large raw_results
+
+        # Filter results by distance if semantic search was performed
+        # and collect results in the desired format (list of dicts)
+        filtered_results = []
+        # Iterate over the normalized results lists
+        for i in range(len(results_ids)):
+             # For semantic search, check distance (only if tags were provided)
+             if params.tags:
+                distance = results_distances[i]
+                if distance > params.max_distance:
+                    continue # Skip if distance is too large
+
+             # Collect the result
+             result_item = {
+                 "file_path": results_ids[i],
+                 "metadata": results_metadatas[i]
+             }
+             filtered_results.append(result_item)
+
+             # Stop if we reached the limit
+             if len(filtered_results) >= params.limit:
+                 break
+
+        return filtered_results
+
+    except RuntimeError as e:
+        # Handle errors from embedding generation
+        log.error(f"Search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+    except Exception as e:
+        log.error(f"An unexpected error occurred during search: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
 @app.delete("/clear_collection/",
@@ -365,24 +552,47 @@ async def search_tracks(
 async def clear_collection():
     """
     Delete all tracks from the collection.
-    
+
     Warning: This operation cannot be undone.
 
     Returns:
     - **message**: Summary of deleted tracks
     """
+    log.info("Clearing entire collection")
+
     global collection
 
-    # Get current count of tracks
-    all_tracks = collection.get()
-    count = len(all_tracks["ids"])
-    
-    # Delete all records
-    client.delete_collection(cfg.chromadb.collection_name)
-    collection = client.create_collection(cfg.chromadb.collection_name)
-    
-    log.info(f"Cleared collection '{cfg.chromadb.collection_name}', deleted {count} tracks")
-    return {"message": f"Collection cleared, {count} tracks deleted"}
+    try:
+        # Get current count of tracks before deletion attempt
+        try:
+            # Use the client to count directly
+            count = client.get_collection(cfg.chromadb.collection_name).count()
+        except Exception as e: # Collection might not exist or other error
+            log.warning(f"Could not get collection count: {e}")
+            # Attempt to delete anyway, in case the error was not about non-existence
+            pass # Continue to deletion attempt
+
+        # Delete the collection and recreate it
+        try:
+            client.delete_collection(cfg.chromadb.collection_name)
+            # Recreate the collection immediately after deletion
+            collection = client.create_collection(cfg.chromadb.collection_name)
+            log.info(f"Cleared collection '{cfg.chromadb.collection_name}', deleted {count} tracks (approximate count before deletion).")
+            return {"message": f"Collection cleared, {count} tracks deleted (approximate count before deletion)."}
+        except Exception as e:
+             log.error(f"Error deleting or recreating collection: {e}")
+             # If deletion/recreation fails, try to get the count again for the error message
+             try:
+                 current_count = client.get_collection(cfg.chromadb.collection_name).count()
+                 error_msg = f"Error clearing collection. Current track count: {current_count}. Error: {e}"
+             except:
+                 error_msg = f"Error clearing collection. Could not get current track count. Error: {e}"
+             raise HTTPException(status_code=500, detail=error_msg)
+
+
+    except Exception as e:
+        log.error(f"An unexpected error occurred during clear_collection: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
 @app.get("/collection_stats/",
@@ -412,83 +622,182 @@ async def collection_stats():
                 "unique_values_count": 200,
                 "types": ["str"]
             }
-        }
+        },
+        "message": "Collection statistics"
     }
     ```
     """
-    # Get all tracks with metadata
-    results = collection.get(
-        include=[IncludeEnum.metadatas, IncludeEnum.embeddings]
-    )
-    
-    if not results["ids"]:
-        return {
-            "total_tracks": 0,
-            "total_size": 0,
-            "metadata_stats": {},
-            "message": "Collection is empty"
-        }
+    log.info("Getting collection statistics")
 
-    # Calculate basic stats
-    total_tracks = len(results["ids"])
-    
-    # Calculate embedding size (approximate)
-    # Each embedding is a list of floats (32 bits = 4 bytes each)
-    embedding_dimension = len(results["embeddings"][0]) if isinstance(results["embeddings"][0], list) else results["embeddings"][0].shape[0]  # type: ignore
-    embedding_size = embedding_dimension * 4 * total_tracks / (1024 * 1024)  # Convert to MB
-    
-    # Analyze metadata fields
-    metadata_fields = {}
-    metadatas = results.get("metadatas", [])
-    if not metadatas:
+    try:
+        # Get all tracks with metadata (embeddings are not needed for stats calculation)
+        # Fetch a limited number of embeddings to get dimension, or get count first
+        count = collection.count()
+
+        if count == 0:
+             return {
+                "total_tracks": 0,
+                "total_size_mb": 0.0,
+                "metadata_stats": {},
+                "embedding_dimensions": 0,
+                "message": "Collection is empty"
+            }
+
+        # Fetch a sample of data to get embedding dimension and metadata info
+        sample_results = collection.get(
+            limit=10, # Fetch a small sample
+            include=["metadatas", "embeddings"]
+        )
+
+        total_tracks = count # Use the actual count
+
+        # Calculate embedding size (approximate)
+        embedding_dimension = 0
+        embedding_size = 0.0
+        
+        # Check if embeddings exist and are not empty
+        if "embeddings" in sample_results and len(sample_results["embeddings"]) > 0:
+            # Handle both list of floats and numpy array embeddings
+            first_embedding = sample_results["embeddings"][0]
+            if isinstance(first_embedding, list):
+                embedding_dimension = len(first_embedding)
+            elif hasattr(first_embedding, 'shape'):  # Check if it's a numpy array or similar
+                embedding_dimension = first_embedding.shape[0]
+            # Assuming float32 (4 bytes)
+            embedding_size = embedding_dimension * 4 * total_tracks / (1024 * 1024)  # Convert to MB
+        else:
+            log.warning("No embeddings found in sample to calculate size and dimension.")
+
+
+        # Analyze metadata fields from the sample (approximation)
+        metadata_fields = {}
+        metadatas = sample_results.get("metadatas", [])
+
+        # For more accurate metadata stats, you might need to iterate through all metadatas
+        # or use aggregation features if ChromaDB supports them efficiently.
+        # This sample-based approach gives an estimate.
+        for metadata in metadatas:
+            if metadata: # Ensure metadata is not None or empty
+                for key, value in metadata.items():
+                    if key not in metadata_fields:
+                        metadata_fields[key] = {
+                            "count": 0,
+                            "unique_values": set(),
+                            "types": set()
+                        }
+                    metadata_fields[key]["count"] += 1
+                    # Convert value to string for unique values set to avoid type issues
+                    metadata_fields[key]["unique_values"].add(str(value))
+                    metadata_fields[key]["types"].add(type(value).__name__)
+
+        # Convert sets to lists for JSON serialization
+        metadata_stats = {}
+        # Note: counts and unique values will be based on the sample, not the full collection
+        for key, stats in metadata_fields.items():
+            metadata_stats[key] = {
+                "sample_count": stats["count"], # Renamed to indicate it's from sample
+                # coverage_percent based on sample might be misleading
+                "unique_values_in_sample": len(stats["unique_values"]),
+                "types": list(stats["types"])
+            }
+        # Add a note about sample-based metadata stats
+        metadata_stats["_note"] = "Metadata stats are based on a sample of 10 tracks for performance. For full stats, a more extensive process is needed."
+
+
         return {
             "total_tracks": total_tracks,
             "total_size_mb": round(embedding_size, 2),
-            "metadata_stats": {},
+            "metadata_stats": metadata_stats,
             "embedding_dimensions": embedding_dimension,
-            "message": "No metadata found in collection"
+            "message": "Collection statistics (metadata stats based on sample)"
         }
 
-    for metadata in metadatas:
-        for key, value in metadata.items():
-            if key not in metadata_fields:
-                metadata_fields[key] = {
-                    "count": 0,
-                    "unique_values": set(),
-                    "types": set()
-                }
-            metadata_fields[key]["count"] += 1
-            metadata_fields[key]["unique_values"].add(str(value))
-            metadata_fields[key]["types"].add(type(value).__name__)
-    
-    # Convert sets to lists for JSON serialization
-    metadata_stats = {}
-    for key, stats in metadata_fields.items():
-        metadata_stats[key] = {
-            "count": stats["count"],
-            "coverage_percent": round(stats["count"] / total_tracks * 100, 1),
-            "unique_values_count": len(stats["unique_values"]),
-            "types": list(stats["types"])
+    except Exception as e:
+        log.error(f"Error getting collection stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting collection stats: {e}")
+
+
+@app.get("/get_metadata_list/",
+    response_model=dict,
+    summary="Get list of unique metadata values",
+    response_description="List of unique values for specified metadata key")
+async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g., 'artist', 'album', etc.)")):
+    """
+    Get a list of all unique values for a specified metadata key.
+
+    Parameters:
+    - **key**: Metadata key to get values for (e.g., 'artist', 'album', 'genre', etc.)
+
+    Returns:
+    - **values**: List of unique values for the specified key
+    - **count**: Total number of unique values
+    """
+    log.info(f"Getting metadata list for key: {key}")
+
+    try:
+        # Get all tracks with metadata
+        results = collection.get(
+            include=["metadatas"]
+        )
+
+        if not results["ids"]:
+            return {
+                "values": [],
+                "count": 0,
+                "message": "Collection is empty"
+            }
+
+        # Extract unique values for the specified key
+        unique_values = set()
+        for metadata in results["metadatas"]:
+            if metadata and key in metadata:
+                value = metadata[key]
+                # Convert to string to handle different types consistently
+                unique_values.add(str(value))
+
+        # Convert to sorted list for consistent ordering
+        values_list = sorted(list(unique_values))
+
+        return {
+            "values": values_list,
+            "count": len(values_list),
+            "message": f"Found {len(values_list)} unique values for '{key}'"
         }
-    
-    return {
-        "total_tracks": total_tracks,
-        "total_size_mb": round(embedding_size, 2),
-        "metadata_stats": metadata_stats,
-        "embedding_dimensions": embedding_dimension
-    }
+
+    except Exception as e:
+        log.error(f"Error getting metadata list for key '{key}': {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting metadata list: {e}"
+        )
 
 
 def _init_logs():
-    for logger_name in cfg.logging.loggers.suppress:
-        logging.getLogger(logger_name).setLevel(getattr(logging, cfg.logging.loggers.suppress_level))
+    """Initializes logging configuration."""
+    # Add checks if cfg.logging and its sub-attributes exist
+    if hasattr(cfg, 'logging'):
+        if hasattr(cfg.logging, 'loggers') and hasattr(cfg.logging.loggers, 'suppress'):
+            for logger_name in cfg.logging.loggers.suppress:
+                if hasattr(cfg.logging.loggers, 'suppress_level'):
+                     level = getattr(logging, cfg.logging.loggers.suppress_level.upper(), logging.WARNING)
+                     logging.getLogger(logger_name).setLevel(level)
+                else:
+                     logging.getLogger(logger_name).setLevel(logging.WARNING) # Default suppress level
 
-    parent_logger.setLevel(cfg.logging.level)
-    if cfg.logging.level == "DEBUG":
-        cfg.print_config()
+        if hasattr(cfg.logging, 'level'):
+             parent_logger.setLevel(getattr(logging, cfg.logging.level.upper(), logging.INFO)) # Default parent level
+             if cfg.logging.level.upper() == "DEBUG":
+                 cfg.print_config()
+        else:
+             parent_logger.setLevel(logging.INFO) # Default parent level
+    else:
+         # Default logging if no config is found
+         parent_logger.setLevel(logging.INFO)
+         logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="%X", handlers=[RichHandler(console=Console(), markup=True)])
 
 
 def _parse_args():
+    """Parses command line arguments."""
     parser = argparse.ArgumentParser(prog=APP_NAME, description="Music2DB Server")
     parser.add_argument(
         "-c",
@@ -517,13 +826,23 @@ def _init_config(files: list[str], unknown_args: list[str]):
 
 
 def main():
+    """Main function to initialize and run the FastAPI application."""
     args, unknown_args = _parse_args()
     _init_config([args.config_file], unknown_args)
-    _init_logs()
-    _init_entities()
+    _init_logs() # Initialize logs after config is loaded
+    _init_entities() # Initialize entities after config and logs
 
     log.info(f"Starting {APP_NAME}")
-    uvicorn.run(app, host=cfg.app.host, port=cfg.app.port)  
+    # Use the 'app' instance that was initialized first
+    # Add a check if cfg.app, cfg.app.host, and cfg.app.port exist
+    if not hasattr(cfg, 'app') or not hasattr(cfg.app, 'host') or not hasattr(cfg.app, 'port'):
+         log.error("App host or port configuration missing in config.yaml")
+         sys.exit(1)
+
+    uvicorn.run(app, 
+                host=cfg.app.host, 
+                port=cfg.app.port, 
+                log_level=cfg.logging.loggers.suppress_level.lower())
 
 
 # Run server
