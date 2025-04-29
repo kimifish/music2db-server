@@ -17,9 +17,10 @@ from fastapi import FastAPI, HTTPException, Query, Depends # Import Depends
 from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 import chromadb
-from typing import Dict, Union, List, Optional, Literal
+from typing import Dict, Union, List, Optional, Literal, Tuple
 import uvicorn
 from functools import lru_cache
+from rapidfuzz import process, fuzz # Import rapidfuzz
 
 try:
     from music2db_server import __version__
@@ -415,11 +416,32 @@ class SearchParams(BaseModel):
     # Optional metadata filters. Use Optional and None as default for flexibility.
     artist: Optional[str] = Field(default=None, description="Filter by artist name")
     album: Optional[str] = Field(default=None, description="Filter by album name")
-    genre: Optional[str] = Field(default=None, description="Filter by genre")
-    year: Optional[Union[int, str]] = Field(default=None, description="Filter by year")
     # Add other metadata fields you might want to filter by
 
     # No need for a validator for 'tags' if it's optional now
+
+
+def _fuzzy_match(query: str, choices: List[str], threshold: int = 80) -> Optional[str]:
+    """
+    Performs fuzzy matching to find the best match for a query in a list of choices.
+
+    Parameters:
+    - query: The string to search for.
+    - choices: The list of strings to search within.
+    - threshold: The minimum score (0-100) for a match to be considered.
+
+    Returns:
+    - The best matching string from choices, or None if no match above the threshold is found.
+    """
+    if not query or not choices:
+        return None
+    # Use extractOne for the single best match
+    match = process.extractOne(query, choices, scorer=fuzz.WRatio)
+    if match and match[1] >= threshold:
+        log.debug(f"Fuzzy match found for '{query}': '{match[0]}' with score {match[1]}")
+        return match[0]
+    log.debug(f"No fuzzy match found for '{query}' above threshold {threshold}")
+    return None
 
 
 @app.get("/search_tracks/",
@@ -434,10 +456,8 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
     - **tags**: Search query string for semantic search (e.g., "rock upbeat energetic"). Optional.
     - **limit**: Maximum number of results to return (1-100, default: 5).
     - **max_distance**: Maximum cosine distance for semantic matches (0.0-2.0, default: 0.7). Only applies if 'tags' is provided.
-    - **artist**: Optional filter by artist name.
-    - **album**: Optional filter by album name.
-    - **genre**: Optional filter by genre.
-    - **year**: Optional filter by year.
+    - **artist**: Optional filter by artist name. Fuzzy matching is applied to find the best match in the database.
+    - **album**: Optional filter by album name. Fuzzy matching is applied to find the best match in the database.
     - Add other optional metadata filter parameters as needed.
 
     Returns:
@@ -450,20 +470,32 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
     """
     log.debug(f"Search query params: {params}")
 
-    # Build the where clause for metadata filtering
+    # Build the where clause for metadata filtering with fuzzy matching
     where_clause = {}
     if params.artist is not None:
-        where_clause["artist"] = params.artist
+        # Get unique artist names and perform fuzzy matching
+        unique_artists = _get_unique_metadata_values("artist")
+        matched_artist = _fuzzy_match(params.artist, unique_artists)
+        if matched_artist:
+            where_clause["artist"] = matched_artist
+            log.info(f"Using fuzzy matched artist: '{matched_artist}' for search.")
+        else:
+            # If no fuzzy match, use the original query or skip filter
+            # For now, let's use the original query for exact match attempt by ChromaDB
+            where_clause["artist"] = params.artist
+            log.info(f"No fuzzy match for artist '{params.artist}', attempting exact match.")
+
     if params.album is not None:
-        where_clause["album"] = params.album
-    if params.genre is not None:
-        where_clause["genre"] = params.genre
-    if params.year is not None:
-        # ChromaDB metadata filtering requires exact match for numbers/strings
-        # Ensure year is stored as string if filtering this way
-        where_clause["year"] = str(params.year)
-        # If you need range queries on year, you might need to store it differently
-        # or handle it outside of the simple where clause.
+        # Get unique album names and perform fuzzy matching
+        unique_albums = _get_unique_metadata_values("album")
+        matched_album = _fuzzy_match(params.album, unique_albums)
+        if matched_album:
+            where_clause["album"] = matched_album
+            log.info(f"Using fuzzy matched album: '{matched_album}' for search.")
+        else:
+            # If no fuzzy match, use the original query
+            where_clause["album"] = params.album
+            log.info(f"No fuzzy match for album '{params.album}', attempting exact match.")
 
     # Add other metadata filters here as needed
 
@@ -718,9 +750,60 @@ async def collection_stats():
         raise HTTPException(status_code=500, detail=f"Error getting collection stats: {e}")
 
 
+def _get_unique_metadata_values(key: str) -> List[Any]:
+    """
+    Get a list of all unique values for a specific metadata key across all tracks.
+
+    Parameters:
+    - **key**: The metadata key to retrieve unique values for.
+
+    Returns:
+    - List of unique metadata values.
+    """
+    log.info(f"Getting unique values for metadata key: {key}")
+
+    try:
+        # Fetch all tracks, including only the specified metadata key
+        # This might be inefficient for very large collections.
+        # A more efficient approach might involve a dedicated metadata index
+        # or a different ChromaDB query if available.
+        all_tracks = collection.get(
+            include=["metadatas"]
+        )
+        # Handle case where results might be None (e.g., empty collection)
+        if all_tracks is None:
+            all_tracks = {"metadatas": []}
+        # Ensure all_tracks is a dictionary
+        if not isinstance(all_tracks, dict):
+            all_tracks = {"metadatas": []}
+        # Ensure 'ids' and 'metadatas' are present
+        if "ids" not in all_tracks:
+            all_tracks["ids"] = []
+        if "metadatas" not in all_tracks:
+            all_tracks["metadatas"] = []
+
+        unique_values = set()
+        metadatas = all_tracks.get("metadatas")
+        if metadatas: # Add check for None
+            for metadata in metadatas:
+                if metadata and key in metadata:
+                    value = metadata[key]
+                    unique_values.add(value)
+
+        # Convert set to list and sort for consistent output
+        sorted_values = sorted(list(unique_values), key=str) # Sort by string representation
+
+        log.info(f"Found {len(sorted_values)} unique values for key '{key}'.")
+        return sorted_values
+
+    except Exception as e:
+        log.error(f"Error getting metadata list for key '{key}': {e}")
+        # Re-raise the exception to be handled by the calling function
+        raise
+
 @app.get("/get_metadata_list/",
     response_model=dict,
-    summary="Get list of unique metadata values",
+    summary="Get unique values for a metadata key",
     response_description="List of unique values for specified metadata key")
 async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g., 'artist', 'album', etc.)")):
     """
@@ -733,50 +816,16 @@ async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g
     - **values**: List of unique values for the specified key
     - **count**: Total number of unique values
     """
-    log.info(f"Getting metadata list for key: {key}")
-
     try:
-        # Get all tracks with metadata
-        results = collection.get(
-            include=["metadatas"]
-        )
-        # Handle case where results might be None (e.g., empty collection)
-        if results is None:
-            results = {"metadatas": []}
-        # Ensure results is a dictionary
-        if not isinstance(results, dict):
-            results = {"metadatas": []}
-        # Ensure 'ids' and 'metadatas' are present
-        if "ids" not in results:
-            results["ids"] = []
-        if "metadatas" not in results:
-            results["metadatas"] = []
-
-        if not results["ids"]:
-            return {
-                "values": [],
-                "count": 0,
-                "message": "Collection is empty"
-            }
-
-        # Extract unique values for the specified key
-        unique_values = set()
-        unique_values = {str(metadata[key]) for metadata in results.get("metadatas", []) if metadata and key in metadata}
-        # Convert to sorted list for consistent ordering
-        values_list = sorted(list(unique_values))
-
+        unique_values = _get_unique_metadata_values(key)
         return {
-            "values": values_list,
-            "count": len(values_list),
-            "message": f"Found {len(values_list)} unique values for '{key}'"
+            "values": unique_values,
+            "count": len(unique_values),
+            "message": f"Found {len(unique_values)} unique values for '{key}'"
         }
-
     except Exception as e:
-        log.error(f"Error getting metadata list for key '{key}': {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error getting metadata list: {e}"
-        )
+        # Handle exceptions raised by _get_unique_metadata_values
+        raise HTTPException(status_code=500, detail=f"Error getting metadata list: {e}")
 
 
 def _init_logs():

@@ -16,6 +16,7 @@ dependencies = [
     "sentence-transformers>=3.4.1",
     "torch",
     "uvicorn>=0.34.0",
+    "rapidfuzz>=3.9.1",
 ]
 
 [project.scripts]
