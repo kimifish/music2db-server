@@ -17,7 +17,7 @@ A FastAPI-based server that provides embedding-based music track indexing and si
 
 ## Requirements
 
-- Python 3.10 or higher
+- Python 3.11 or higher
 - ChromaDB server instance
 - `serv4-embeddings` HTTP service
 - UV package manager (recommended)

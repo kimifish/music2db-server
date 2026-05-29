@@ -2,23 +2,27 @@
 # pyright: reportAttributeAccessIssue=false
 
 import argparse
-import os
 import sys
-from pathlib import Path
 from typing import Dict, Any
 from dotenv import load_dotenv
-from kimiconfig import Config
-cfg = Config(use_dataclasses=True)
 from rich.traceback import install as install_rich_traceback
 from fastapi import FastAPI, HTTPException, Query, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import chromadb
-import httpx
 from typing import Dict, Union, List, Optional
 import uvicorn
 from functools import lru_cache
 from rapidfuzz import process, fuzz
+from .config_loader import get_active_config_files, load_settings, load_logging_config, resolve_config_files, resolve_logging_config_file, set_active_config_files
+from .embeddings import (
+    EmbeddingsServiceError,
+    generate_embedding,
+    generate_embeddings,
+    get_embeddings_health,
+    get_embeddings_settings,
+)
 from .logging_setup import get_logger, setup_logging
+from .settings import Settings
 
 try:
     from music2db_server import __version__
@@ -28,11 +32,6 @@ except ImportError:
 
 # Initialize config
 APP_NAME = "music2db_server"
-HOME_DIR = os.path.expanduser("~")
-SYSTEM_CONFIG_DIR = Path("/etc") / APP_NAME
-XDG_CONFIG_DIR = Path(os.getenv("XDG_CONFIG_HOME", os.path.join(HOME_DIR, ".config"))) / APP_NAME
-LOCAL_CONFIG_DIR = Path.cwd() / "config"
-ACTIVE_CONFIG_FILES: list[Path] = []
 
 load_dotenv()
 
@@ -55,104 +54,23 @@ app = FastAPI(
 
 client: chromadb.HttpClient  # type: ignore
 collection: chromadb.Collection
-
-
-class EmbeddingsServiceError(RuntimeError):
-    """Raised when the external embeddings service fails."""
-
-
-class EmbeddingsResponse(BaseModel):
-    model: str
-    input_type: str
-    dimensions: int
-    embeddings: list[list[float]]
+settings: Settings
 
 
 def _get_embeddings_settings() -> tuple[str, Optional[str], bool, float]:
-    """Returns embeddings service settings from config."""
-    if not hasattr(cfg, "embeddings"):
-        log.error("`config` Embeddings configuration missing in config.yaml")
-        sys.exit(1)
-
-    embeddings_cfg = cfg.embeddings
-    if not hasattr(embeddings_cfg, "base_url"):
-        log.error("`config` Embeddings base_url missing in config.yaml")
-        sys.exit(1)
-
-    base_url = str(embeddings_cfg.base_url).rstrip("/")
-    model_name = str(embeddings_cfg.model) if hasattr(embeddings_cfg, "model") else None
-    normalize = bool(getattr(embeddings_cfg, "normalize", True))
-    timeout_seconds = float(getattr(embeddings_cfg, "timeout_seconds", 30))
-    return base_url, model_name, normalize, timeout_seconds
-
-
-def _request_embeddings(texts: list[str], input_type: str) -> EmbeddingsResponse:
-    """Fetches embeddings from the external embeddings service."""
-    if not texts:
-        raise ValueError("texts must not be empty")
-
-    base_url, model_name, normalize, timeout_seconds = _get_embeddings_settings()
-    payload: dict[str, Any] = {
-        "texts": texts,
-        "input_type": input_type,
-        "normalize": normalize,
-    }
-    if model_name:
-        payload["model"] = model_name
-
-    log.debug("`http` POST %s/v1/embeddings texts=%s input_type=%s", base_url, len(texts), input_type)
-
-    try:
-        with httpx.Client(timeout=timeout_seconds) as http_client:
-            response = http_client.post(f"{base_url}/v1/embeddings", json=payload)
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text
-        try:
-            error_payload = exc.response.json()
-            detail = error_payload.get("error", {}).get("message", detail)
-        except ValueError:
-            pass
-        raise EmbeddingsServiceError(
-            f"Embeddings service returned {exc.response.status_code}: {detail}"
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise EmbeddingsServiceError(f"Embeddings service request failed: {exc}") from exc
-
-    return EmbeddingsResponse.model_validate(response.json())
+    return get_embeddings_settings(settings, log)
 
 
 def _generate_embedding(text: str, input_type: str) -> list[float]:
-    """Generates a single embedding via the external embeddings service."""
-    response = _request_embeddings([text], input_type)
-    return response.embeddings[0]
+    return generate_embedding(settings, log, text, input_type)
 
 
 def _generate_embeddings(texts: list[str], input_type: str) -> list[list[float]]:
-    """Generates embeddings for multiple texts via the external embeddings service."""
-    return _request_embeddings(texts, input_type).embeddings
+    return generate_embeddings(settings, log, texts, input_type)
 
 
 def _get_embeddings_health() -> dict[str, Any]:
-    """Checks embeddings service health and basic model compatibility."""
-    base_url, model_name, _, timeout_seconds = _get_embeddings_settings()
-
-    try:
-        log.debug("`http` GET %s/health", base_url)
-        with httpx.Client(timeout=timeout_seconds) as http_client:
-            response = http_client.get(f"{base_url}/health")
-        response.raise_for_status()
-        payload = response.json()
-    except httpx.HTTPError as exc:
-        raise EmbeddingsServiceError(f"Embeddings health check failed: {exc}") from exc
-
-    loaded_model = payload.get("model")
-    if model_name and loaded_model and loaded_model != model_name:
-        raise EmbeddingsServiceError(
-            f"Configured embeddings model '{model_name}' does not match loaded model '{loaded_model}'"
-        )
-
-    return payload
+    return get_embeddings_health(settings, log)
 
 def _init_entities():
     """Initializes the ChromaDB client/collection and validates embeddings service."""
@@ -165,17 +83,8 @@ def _init_entities():
         _get_embeddings_settings()[0],
     )
 
-    if not hasattr(cfg, 'chromadb') or not hasattr(cfg.chromadb, 'host') or not hasattr(cfg.chromadb, 'port'):
-         log.error("`config` ChromaDB configuration missing in config.yaml")
-         sys.exit(1)
-
-    client = chromadb.HttpClient(host=cfg.chromadb.host, port=cfg.chromadb.port)
-    # Use get_or_create_collection to ensure it exists
-    # Add a check if cfg.chromadb.collection_name exists
-    if not hasattr(cfg.chromadb, 'collection_name'):
-         log.error("`config` ChromaDB collection name missing in config.yaml")
-         sys.exit(1)
-    collection = client.get_or_create_collection(cfg.chromadb.collection_name)
+    client = chromadb.HttpClient(host=settings.chromadb.host, port=settings.chromadb.port)
+    collection = client.get_or_create_collection(settings.chromadb.collection_name)
 
 
 # Modified function to generate tag string, focusing on descriptive tags
@@ -689,7 +598,7 @@ async def clear_collection(confirm: bool = Query(False, description="Explicitly 
 
     global collection
 
-    if not getattr(getattr(cfg, "admin", object()), "clear_collection_enabled", False):
+    if not settings.admin.clear_collection_enabled:
         raise HTTPException(status_code=403, detail="clear_collection is disabled by configuration")
 
     if not confirm:
@@ -699,7 +608,7 @@ async def clear_collection(confirm: bool = Query(False, description="Explicitly 
         # Get current count of tracks before deletion attempt
         try:
             # Use the client to count directly
-            count = client.get_collection(cfg.chromadb.collection_name).count()
+            count = client.get_collection(settings.chromadb.collection_name).count()
         except Exception as e: # Collection might not exist or other error
             log.warning("`state` Could not get collection count: %s", e)
             # Attempt to delete anyway, in case the error was not about non-existence
@@ -707,16 +616,16 @@ async def clear_collection(confirm: bool = Query(False, description="Explicitly 
 
         # Delete the collection and recreate it
         try:
-            client.delete_collection(cfg.chromadb.collection_name)
+            client.delete_collection(settings.chromadb.collection_name)
             # Recreate the collection immediately after deletion
-            collection = client.create_collection(cfg.chromadb.collection_name)
-            log.info("`state` Cleared collection '%s', deleted %s tracks (approximate count before deletion).", cfg.chromadb.collection_name, count)
+            collection = client.create_collection(settings.chromadb.collection_name)
+            log.info("`state` Cleared collection '%s', deleted %s tracks (approximate count before deletion).", settings.chromadb.collection_name, count)
             return {"message": f"Collection cleared, {count} tracks deleted (approximate count before deletion)."}
         except Exception as e:
             log.error("`state` Error deleting or recreating collection: %s", e)
             # If deletion/recreation fails, try to get the count again for the error message
             try:
-                current_count = client.get_collection(cfg.chromadb.collection_name).count()
+                current_count = client.get_collection(settings.chromadb.collection_name).count()
                 error_msg = f"Error clearing collection. Current track count: {current_count}. Error: {e}"
             except Exception:
                 error_msg = f"Error clearing collection. Could not get current track count. Error: {e}"
@@ -918,99 +827,12 @@ async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g
         raise HTTPException(status_code=500, detail=f"Error getting metadata list: {e}")
 
 
-def _default_logging_config() -> dict[str, Any]:
-    return {
-        "level": "INFO",
-        "console": True,
-        "file_enabled": False,
-        "file": "logs/music2db-server.log",
-        "show_time": True,
-        "time_format": "%H:%M:%S",
-        "show_level": False,
-        "show_path": False,
-        "logs_width": 140,
-        "tags_width": 16,
-        "tag_filter_mode": "any",
-        "unknown_tags": "hide",
-        "show_all_tags_errors": True,
-        "show_all_tags_warnings": True,
-        "level_decor": {
-            "notset": {"symbol": "█"},
-            "debug": {"symbol": "█"},
-            "info": {"symbol": "█"},
-            "warning": {"symbol": "█"},
-            "error": {"symbol": "█"},
-            "critical": {"symbol": "█"},
-        },
-        "loggers": {
-            "uvicorn": "WARNING",
-            "uvicorn.error": "WARNING",
-            "uvicorn.access": "WARNING",
-            "starlette": "WARNING",
-            "fastapi": "WARNING",
-            "httpx": "WARNING",
-            "httpcore": "WARNING",
-            "urllib3.connectionpool": "WARNING",
-        },
-        "tags": {
-            "startup": {"show": True, "icon": "S", "tag_color": "#5f875f", "icon_color": "#ffffff"},
-            "config": {"show": True, "icon": "cfg", "tag_color": "#5f5f87", "icon_color": "#ffffff"},
-            "api": {"show": True, "icon": "api", "tag_color": "#005f87", "icon_color": "#ffffff"},
-            "http": {"show": False, "icon": "http", "tag_color": "#444444", "icon_color": "#ffffff"},
-            "metrics": {"show": False, "icon": "M", "tag_color": "#008787", "icon_color": "#ffffff"},
-            "state": {"show": True, "icon": "st", "tag_color": "#875f00", "icon_color": "#ffffff"},
-        },
-    }
-
-
-def _config_search_dirs() -> list[Path]:
-    return [SYSTEM_CONFIG_DIR, XDG_CONFIG_DIR, LOCAL_CONFIG_DIR]
-
-
-def _discover_config_files(filename: str) -> list[str]:
-    return [str(path / filename) for path in _config_search_dirs() if (path / filename).exists()]
-
-
-def _resolve_logging_config_file() -> Path | None:
-    explicit_path = getattr(getattr(cfg, "app", object()), "logging_config", None)
-    if explicit_path:
-        return Path(str(explicit_path)).expanduser()
-
-    for config_file in reversed(ACTIVE_CONFIG_FILES):
-        logging_path = config_file.parent / "logging.yaml"
-        if logging_path.exists():
-            return logging_path
-
-    for candidate in reversed(_config_search_dirs()):
-        logging_path = candidate / "logging.yaml"
-        if logging_path.exists():
-            return logging_path
-
-    return None
-
-
-def _merge_logging_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge_logging_config(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+def _resolve_logging_config_file():
+    return resolve_logging_config_file(settings, APP_NAME)
 
 
 def _load_logging_config() -> dict[str, Any]:
-    config = _default_logging_config()
-    logging_path = _resolve_logging_config_file()
-
-    if logging_path and logging_path.exists():
-        import yaml
-
-        with logging_path.open("r", encoding="utf-8") as file:
-            loaded = yaml.safe_load(file) or {}
-        config = _merge_logging_config(config, loaded)
-
-    return config
+    return load_logging_config(settings, APP_NAME)
 
 
 def _init_logs() -> None:
@@ -1023,7 +845,7 @@ def _init_logs() -> None:
     )
 
     if str(logging_config.get("level", "INFO")).upper() == "DEBUG":
-        log.debug("`config` Active config files: %s", [str(path) for path in ACTIVE_CONFIG_FILES])
+        log.debug("`config` Active config files: %s", [str(path) for path in get_active_config_files()])
 
 
 def _parse_args():
@@ -1036,52 +858,47 @@ def _parse_args():
         default=None,
         help="Configuration file location.",
     )
-    return parser.parse_known_args()
+    return parser.parse_args()
 
 
-def _init_config(files: list[str], unknown_args: list[str]):
+def _init_config(files: list[str]):
     """
-    Initializes the configuration by loading configuration files and passed arguments.
+    Initializes the configuration by loading configuration files.
 
     Args:
         files (List[str]): List of config files.
-        unknown_args (List[str]): List of arguments (unknown for argparse).
     """
-    global ACTIVE_CONFIG_FILES
-    ACTIVE_CONFIG_FILES = [Path(file).expanduser() for file in files]
-    cfg.load_files(files)
-    cfg.load_args(unknown_args)
+    global settings
+    if not files:
+        print(f"No config.yaml found for {APP_NAME}. Checked /etc, XDG config, and ./config", file=sys.stderr)
+        raise SystemExit(1)
+
+    set_active_config_files(files)
+    try:
+        settings = load_settings(files)
+    except ValidationError as exc:
+        print(f"Invalid configuration for {APP_NAME}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 def _resolve_config_files(config_file: str | None) -> list[str]:
-    if config_file:
-        return [str(Path(config_file).expanduser())]
-    return _discover_config_files("config.yaml")
-
-    # # add some/override config here if needed
-    # cfg.update('runtime.blablabla', True)
-    # cfg.update('religion.buddhism.name', 'Gautama Siddharta')
+    return resolve_config_files(APP_NAME, config_file)
 
 
 def main():
     """Main function to initialize and run the FastAPI application."""
-    args, unknown_args = _parse_args()
+    args = _parse_args()
     config_files = _resolve_config_files(args.config_file)
-    _init_config(config_files, unknown_args)
+    _init_config(config_files)
     _init_logs() # Initialize logs after config is loaded
     _init_entities() # Initialize entities after config and logs
 
     log.info("`startup` Starting %s", APP_NAME)
-    # Use the 'app' instance that was initialized first
-    # Add a check if cfg.app, cfg.app.host, and cfg.app.port exist
-    if not hasattr(cfg, 'app') or not hasattr(cfg.app, 'host') or not hasattr(cfg.app, 'port'):
-         log.error("`config` App host or port configuration missing in config.yaml")
-         sys.exit(1)
 
     uvicorn.run(
         app,
-        host=cfg.app.host,
-        port=cfg.app.port,
+        host=settings.app.host,
+        port=settings.app.port,
         log_level=str(_load_logging_config().get("loggers", {}).get("uvicorn", "warning")).lower(),
     )
 

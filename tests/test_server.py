@@ -19,6 +19,9 @@ rapidfuzz_stub.fuzz = SimpleNamespace(WRatio=object())
 sys.modules.setdefault("rapidfuzz", rapidfuzz_stub)
 
 from music2db_server import server
+from music2db_server import config_loader
+from music2db_server import embeddings as embeddings_module
+from music2db_server.settings import AdminSettings, AppSettings, ChromaDBSettings, EmbeddingsSettings, Settings
 
 
 def test_generate_embedding_uses_external_service(monkeypatch):
@@ -51,18 +54,20 @@ def test_generate_embedding_uses_external_service(monkeypatch):
             captured["json"] = json
             return FakeResponse()
 
-    monkeypatch.setattr(server.httpx, "Client", FakeClient)
+    monkeypatch.setattr(embeddings_module.httpx, "Client", FakeClient)
     monkeypatch.setattr(
         server,
-        "cfg",
-        SimpleNamespace(
-            embeddings=SimpleNamespace(
+        "settings",
+        Settings(
+            chromadb=ChromaDBSettings(host="localhost"),
+            embeddings=EmbeddingsSettings(
                 base_url="http://127.0.0.1:8098",
                 model="intfloat/multilingual-e5-small",
                 normalize=True,
                 timeout_seconds=12,
-            )
+            ),
         ),
+        raising=False,
     )
 
     embedding = server._generate_embedding("hello", "query")
@@ -83,11 +88,12 @@ def test_generate_embedding_uses_external_service(monkeypatch):
 def test_clear_collection_is_hidden_and_forbidden_when_disabled(monkeypatch):
     monkeypatch.setattr(
         server,
-        "cfg",
-        SimpleNamespace(
-            admin=SimpleNamespace(clear_collection_enabled=False),
-            chromadb=SimpleNamespace(collection_name="music_collection"),
+        "settings",
+        Settings(
+            chromadb=ChromaDBSettings(host="localhost", collection_name="music_collection"),
+            admin=AdminSettings(clear_collection_enabled=False),
         ),
+        raising=False,
     )
 
     client = TestClient(server.app)
@@ -147,7 +153,7 @@ def test_resolve_config_files_uses_etc_xdg_local_order(monkeypatch, tmp_path):
         directory.mkdir()
         (directory / "config.yaml").write_text("app: {}\n", encoding="utf-8")
 
-    monkeypatch.setattr(server, "_config_search_dirs", lambda: [etc_dir, xdg_dir, local_dir])
+    monkeypatch.setattr(config_loader, "config_search_dirs", lambda app_name, cwd=None: [etc_dir, xdg_dir, local_dir])
 
     assert server._resolve_config_files(None) == [
         str(etc_dir / "config.yaml"),
@@ -164,8 +170,16 @@ def test_resolve_logging_config_file_prefers_companion_of_explicit_config(monkey
     config_path.write_text("app: {}\n", encoding="utf-8")
     logging_path.write_text("level: DEBUG\n", encoding="utf-8")
 
-    monkeypatch.setattr(server, "ACTIVE_CONFIG_FILES", [config_path])
-    monkeypatch.setattr(server, "cfg", SimpleNamespace(app=SimpleNamespace()))
-    monkeypatch.setattr(server, "_config_search_dirs", lambda: [])
+    monkeypatch.setattr(config_loader, "ACTIVE_CONFIG_FILES", [config_path])
+    monkeypatch.setattr(
+        server,
+        "settings",
+        Settings(
+            app=AppSettings(),
+            chromadb=ChromaDBSettings(host="localhost"),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(config_loader, "config_search_dirs", lambda app_name, cwd=None: [])
 
     assert server._resolve_logging_config_file() == logging_path
