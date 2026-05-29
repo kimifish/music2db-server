@@ -1,25 +1,25 @@
 
 # Music2DB Server
 
-Version: 0.2.5
+Version: 0.3.3
 
-A FastAPI-based server that provides embedding-based music track indexing and similarity search using ChromaDB and Sentence Transformers.
+A FastAPI-based server that provides embedding-based music track indexing and similarity search using ChromaDB and an external embeddings service.
 
 ## Features
 
 - Store music tracks with associated metadata in ChromaDB
-- Generate embeddings for music tracks based on their metadata
+- Generate embeddings for music tracks via external HTTP embeddings API
 - Search similar tracks using semantic similarity
 - RESTful API with FastAPI
 - Configurable via YAML files
-- Prometheus metrics for monitoring
 - Efficient batch operations
-- Caching for improved performance
+- Cached query embeddings for repeated searches
 
 ## Requirements
 
 - Python 3.10 or higher
 - ChromaDB server instance
+- `serv4-embeddings` HTTP service
 - UV package manager (recommended)
 
 ## Installation
@@ -58,7 +58,8 @@ A FastAPI-based server that provides embedding-based music track indexing and si
 
     ```bash
     mkdir -p ~/.config/music2db_server
-    cp config.yaml ~/.config/music2db_server/
+    cp config/config.yaml ~/.config/music2db_server/config.yaml
+    cp config/logging.yaml ~/.config/music2db_server/logging.yaml
     ```
 
 3. Install systemd service:
@@ -71,40 +72,48 @@ A FastAPI-based server that provides embedding-based music track indexing and si
 
 ## Configuration
 
-Create a configuration file at `~/.config/music2db_server/config.yaml` or specify a custom path using the `-c` flag:
+Configuration files are loaded in this order, with later files overriding earlier ones:
+
+1. `/etc/music2db_server/config.yaml`
+2. `$XDG_CONFIG_HOME/music2db_server/config.yaml` or `~/.config/music2db_server/config.yaml`
+3. `./config/config.yaml` relative to the current working directory
+
+You can also specify a custom config path with `-c`.
+
+Default `config/config.yaml`:
 
 ```yaml
 app:
   host: "0.0.0.0"
   port: 5005
 
-logging:
-  level: "INFO"
-  loggers:
-    suppress:
-      - "httpx"
-      - "httpcore"
-      - "mutagen"
-      - "uvicorn"
-    suppress_level: "WARNING"
-
-model:
-  name: "all-MiniLM-L6-v2"
+embeddings:
+  base_url: "http://127.0.0.1:8098"
+  model: "intfloat/multilingual-e5-small"
+  normalize: true
+  timeout_seconds: 30
 
 chromadb:
   host: "localhost"
   port: 8000
   collection_name: "music_collection"
+
+admin:
+  clear_collection_enabled: false
 ```
+
+Embeddings are requested from `serv4-embeddings` over HTTP. For E5 models the server uses `input_type=passage` while indexing and `input_type=query` while searching.
+
+Logging is loaded with the same precedence from `logging.yaml` in `/etc/music2db_server/`, `$XDG_CONFIG_HOME/music2db_server/` and local `./config/`. A custom path can still be set via `app.logging_config`.
 
 ## Usage
 
 1. Start the server:
 
     ```bash
-    python src/server.py
+    music2db-server
     # Or with custom config:
-    python src/server.py -c /path/to/config.yaml
+    music2db-server -c /path/to/config.yaml
     ```
 
 2. API Endpoints:
@@ -138,27 +147,17 @@ chromadb:
     - `GET /search_tracks/?tags=rock%20upbeat&limit=5`: Search similar tracks
 
         ```json
-        {
-            "tracks": [
-                {
-                    "path": "/music/path/to/track.mp3",
-                    "metadata": { ... },
-                    "similarity_score": 0.95
-                }
-            ]
-        }
+        [
+            {
+                "file_path": "/music/path/to/track.mp3",
+                "metadata": { ... }
+            }
+        ]
         ```
 
     - `GET /list_tracks/`: List all tracked files
     - `GET /health/`: Server health check
-    - `DELETE /clear_collection/`: Clear all tracks (use with caution)
-
-## Monitoring
-
-The server exposes Prometheus metrics at `/metrics` endpoint:
-
-- `music2db_requests_total`: Total requests by endpoint
-- `music2db_request_latency_seconds`: Request latency by endpoint
+    - `DELETE /clear_collection/?confirm=true`: Hidden maintenance endpoint, available only when `admin.clear_collection_enabled=true`
 
 ## Development
 

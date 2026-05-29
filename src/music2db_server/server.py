@@ -2,25 +2,23 @@
 # pyright: reportAttributeAccessIssue=false
 
 import argparse
-import logging
 import os
 import sys
+from pathlib import Path
 from typing import Dict, Any
 from dotenv import load_dotenv
 from kimiconfig import Config
 cfg = Config(use_dataclasses=True)
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.pretty import pretty_repr
 from rich.traceback import install as install_rich_traceback
-from fastapi import FastAPI, HTTPException, Query, Depends # Import Depends
-from pydantic import BaseModel, Field, field_validator
-from sentence_transformers import SentenceTransformer
+from fastapi import FastAPI, HTTPException, Query, Depends
+from pydantic import BaseModel, Field
 import chromadb
-from typing import Dict, Union, List, Optional, Literal, Tuple
+import httpx
+from typing import Dict, Union, List, Optional
 import uvicorn
 from functools import lru_cache
-from rapidfuzz import process, fuzz # Import rapidfuzz
+from rapidfuzz import process, fuzz
+from .logging_setup import get_logger, setup_logging
 
 try:
     from music2db_server import __version__
@@ -31,22 +29,14 @@ except ImportError:
 # Initialize config
 APP_NAME = "music2db_server"
 HOME_DIR = os.path.expanduser("~")
-DEFAULT_CONFIG_FILE = os.path.join(
-    os.getenv("XDG_CONFIG_HOME", os.path.join(HOME_DIR, ".config")),
-    APP_NAME,
-    "config.yaml")
+SYSTEM_CONFIG_DIR = Path("/etc") / APP_NAME
+XDG_CONFIG_DIR = Path(os.getenv("XDG_CONFIG_HOME", os.path.join(HOME_DIR, ".config"))) / APP_NAME
+LOCAL_CONFIG_DIR = Path.cwd() / "config"
+ACTIVE_CONFIG_FILES: list[Path] = []
 
 load_dotenv()
 
-# Logging setup
-logging.basicConfig(
-    level=logging.NOTSET,
-    format="%(message)s",
-    datefmt="%X",
-    handlers=[RichHandler(console=Console(), markup=True)],
-)
-parent_logger = logging.getLogger(APP_NAME)
-log = logging.getLogger(f"{APP_NAME}.main")
+log = get_logger(__name__)
 install_rich_traceback(show_locals=True)
 
 class Track(BaseModel):
@@ -63,30 +53,127 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-model: SentenceTransformer
 client: chromadb.HttpClient  # type: ignore
 collection: chromadb.Collection
 
-def _init_entities():
-    """Initializes the SentenceTransformer model and ChromaDB client/collection."""
-    global model, client, collection # Removed 'app' as it's initialized globally
-    # Ensure the model name is correctly configured
-    # Add a check if cfg.model and cfg.model.name exist
-    if not hasattr(cfg, 'model') or not hasattr(cfg.model, 'name'):
-        log.error("Model configuration missing in config.yaml")
-        sys.exit(1)
-    model = SentenceTransformer(cfg.model.name)
 
-    # Add a check if cfg.chromadb, cfg.chromadb.host, and cfg.chromadb.port exist
+class EmbeddingsServiceError(RuntimeError):
+    """Raised when the external embeddings service fails."""
+
+
+class EmbeddingsResponse(BaseModel):
+    model: str
+    input_type: str
+    dimensions: int
+    embeddings: list[list[float]]
+
+
+def _get_embeddings_settings() -> tuple[str, Optional[str], bool, float]:
+    """Returns embeddings service settings from config."""
+    if not hasattr(cfg, "embeddings"):
+        log.error("`config` Embeddings configuration missing in config.yaml")
+        sys.exit(1)
+
+    embeddings_cfg = cfg.embeddings
+    if not hasattr(embeddings_cfg, "base_url"):
+        log.error("`config` Embeddings base_url missing in config.yaml")
+        sys.exit(1)
+
+    base_url = str(embeddings_cfg.base_url).rstrip("/")
+    model_name = str(embeddings_cfg.model) if hasattr(embeddings_cfg, "model") else None
+    normalize = bool(getattr(embeddings_cfg, "normalize", True))
+    timeout_seconds = float(getattr(embeddings_cfg, "timeout_seconds", 30))
+    return base_url, model_name, normalize, timeout_seconds
+
+
+def _request_embeddings(texts: list[str], input_type: str) -> EmbeddingsResponse:
+    """Fetches embeddings from the external embeddings service."""
+    if not texts:
+        raise ValueError("texts must not be empty")
+
+    base_url, model_name, normalize, timeout_seconds = _get_embeddings_settings()
+    payload: dict[str, Any] = {
+        "texts": texts,
+        "input_type": input_type,
+        "normalize": normalize,
+    }
+    if model_name:
+        payload["model"] = model_name
+
+    log.debug("`http` POST %s/v1/embeddings texts=%s input_type=%s", base_url, len(texts), input_type)
+
+    try:
+        with httpx.Client(timeout=timeout_seconds) as http_client:
+            response = http_client.post(f"{base_url}/v1/embeddings", json=payload)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text
+        try:
+            error_payload = exc.response.json()
+            detail = error_payload.get("error", {}).get("message", detail)
+        except ValueError:
+            pass
+        raise EmbeddingsServiceError(
+            f"Embeddings service returned {exc.response.status_code}: {detail}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise EmbeddingsServiceError(f"Embeddings service request failed: {exc}") from exc
+
+    return EmbeddingsResponse.model_validate(response.json())
+
+
+def _generate_embedding(text: str, input_type: str) -> list[float]:
+    """Generates a single embedding via the external embeddings service."""
+    response = _request_embeddings([text], input_type)
+    return response.embeddings[0]
+
+
+def _generate_embeddings(texts: list[str], input_type: str) -> list[list[float]]:
+    """Generates embeddings for multiple texts via the external embeddings service."""
+    return _request_embeddings(texts, input_type).embeddings
+
+
+def _get_embeddings_health() -> dict[str, Any]:
+    """Checks embeddings service health and basic model compatibility."""
+    base_url, model_name, _, timeout_seconds = _get_embeddings_settings()
+
+    try:
+        log.debug("`http` GET %s/health", base_url)
+        with httpx.Client(timeout=timeout_seconds) as http_client:
+            response = http_client.get(f"{base_url}/health")
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPError as exc:
+        raise EmbeddingsServiceError(f"Embeddings health check failed: {exc}") from exc
+
+    loaded_model = payload.get("model")
+    if model_name and loaded_model and loaded_model != model_name:
+        raise EmbeddingsServiceError(
+            f"Configured embeddings model '{model_name}' does not match loaded model '{loaded_model}'"
+        )
+
+    return payload
+
+def _init_entities():
+    """Initializes the ChromaDB client/collection and validates embeddings service."""
+    global client, collection
+
+    embeddings_health = _get_embeddings_health()
+    log.info(
+        "`startup` Embeddings service ready: %s (%s)",
+        embeddings_health.get("model", "unknown-model"),
+        _get_embeddings_settings()[0],
+    )
+
     if not hasattr(cfg, 'chromadb') or not hasattr(cfg.chromadb, 'host') or not hasattr(cfg.chromadb, 'port'):
-         log.error("ChromaDB configuration missing in config.yaml")
+         log.error("`config` ChromaDB configuration missing in config.yaml")
          sys.exit(1)
 
     client = chromadb.HttpClient(host=cfg.chromadb.host, port=cfg.chromadb.port)
     # Use get_or_create_collection to ensure it exists
     # Add a check if cfg.chromadb.collection_name exists
     if not hasattr(cfg.chromadb, 'collection_name'):
-         log.error("ChromaDB collection name missing in config.yaml")
+         log.error("`config` ChromaDB collection name missing in config.yaml")
          sys.exit(1)
     collection = client.get_or_create_collection(cfg.chromadb.collection_name)
 
@@ -143,7 +230,7 @@ async def _check_existing_track(file_path: str, metadata: Dict[str, Any]) -> tup
 
         return True, metadata_changed
     except Exception as e:
-        log.error(f"Error checking existing track {file_path}: {e}")
+        log.error("`state` Error checking existing track %s: %s", file_path, e)
         # Assume it doesn't exist or needs update in case of error
         # Returning True, True will cause it to be deleted and re-added
         return False, True
@@ -180,19 +267,19 @@ async def add_track(track: Track):
     Returns:
     - **message**: Success or error message
     """
-    log.info(f"Adding track: {track.file_path}")
+    log.info("`api` Adding track: %s", track.file_path)
 
     try:
         exists, needs_update = await _check_existing_track(track.file_path, track.metadata)
 
         if exists and not needs_update:
-            log.info(f"Track '{track.file_path}' already exists with same metadata, skipping.")
+            log.info("`state` Track '%s' already exists with same metadata, skipping.", track.file_path)
             return {"message": f"Track '{track.file_path}' already exists with same metadata"}
 
         if exists and needs_update:
             # Delete old record before adding the new one
             collection.delete(ids=[track.file_path])
-            log.info(f"Deleted existing track '{track.file_path}' with different metadata for update.")
+            log.info("`state` Deleted existing track '%s' with different metadata for update.", track.file_path)
 
         # Generate tag string focusing on descriptive elements for embedding
         tags_for_embedding = generate_tag_string(track.file_path, track.metadata)
@@ -200,16 +287,16 @@ async def add_track(track: Track):
         # Generate embedding on server
         # Ensure the input to encode is not empty if no descriptive tags are found
         if not tags_for_embedding:
-             log.warning(f"No descriptive tags found for '{track.file_path}', using file path for embedding.")
+             log.warning("`state` No descriptive tags found for '%s', using file path for embedding.", track.file_path)
              tags_for_embedding = track.file_path # Fallback to file path if no descriptive tags
 
         # Add a check for empty tags_for_embedding even after fallback
         if not tags_for_embedding:
-             log.error(f"Could not generate embedding string for '{track.file_path}'. Skipping.")
+             log.error("`state` Could not generate embedding string for '%s'. Skipping.", track.file_path)
              raise HTTPException(status_code=400, detail=f"Could not generate embedding string for '{track.file_path}'")
 
 
-        embedding = model.encode(tags_for_embedding).tolist()
+        embedding = _generate_embedding(tags_for_embedding, "passage")
 
         # Add to ChromaDB. Store full metadata for filtering.
         collection.add(
@@ -219,11 +306,14 @@ async def add_track(track: Track):
         )
 
         status_msg = "updated" if exists else "added"
-        log.info(f"Track '{track.file_path}' {status_msg} successfully.")
+        log.info("`state` Track '%s' %s successfully.", track.file_path, status_msg)
         return {"message": f"Track '{track.file_path}' {status_msg} successfully"}
 
+    except EmbeddingsServiceError as e:
+        log.error("`http` Error adding track '%s': %s", track.file_path, e)
+        raise HTTPException(status_code=503, detail=f"Error adding track: {e}")
     except Exception as e:
-        log.error(f"Error adding track '{track.file_path}': {e}")
+        log.error("`state` Error adding track '%s': %s", track.file_path, e)
         # Return a more specific error if it's an HTTPException already
         if isinstance(e, HTTPException):
             raise e
@@ -261,18 +351,15 @@ async def add_tracks(tracks: list[Track]):
     Returns:
     - **message**: Summary of added and updated tracks
     """
-    log.info(f"Adding batch of {len(tracks)} tracks")
+    log.info("`api` Adding batch of %s tracks", len(tracks))
 
     added_count = 0
     updated_count = 0
     skipped_count = 0
     errors = []
 
-    # Prepare lists for batching (optional, current implementation is sequential)
-    # batch_embeddings = []
-    # batch_metadatas = []
-    # batch_ids = []
-    # tracks_to_delete = []
+    tracks_to_add: list[Track] = []
+    tracks_to_delete: list[str] = []
 
     for track in tracks:
         try:
@@ -283,51 +370,53 @@ async def add_tracks(tracks: list[Track]):
                 continue
 
             if exists and needs_update:
-                # Collect IDs for batch deletion before adding
-                # tracks_to_delete.append(track.file_path)
-                # For sequential processing, delete immediately
-                collection.delete(ids=[track.file_path])
+                tracks_to_delete.append(track.file_path)
                 updated_count += 1
-                log.info(f"Deleted existing track '{track.file_path}' for batch update.")
 
             tags_for_embedding = generate_tag_string(track.file_path, track.metadata)
             if not tags_for_embedding:
-                 log.warning(f"No descriptive tags found for '{track.file_path}' in batch, using file path for embedding.")
+                 log.warning("`state` No descriptive tags found for '%s' in batch, using file path for embedding.", track.file_path)
                  tags_for_embedding = track.file_path # Fallback
 
             # Add a check for empty tags_for_embedding even after fallback
             if not tags_for_embedding:
-                 log.error(f"Could not generate embedding string for '{track.file_path}' in batch. Skipping.")
+                 log.error("`state` Could not generate embedding string for '%s' in batch. Skipping.", track.file_path)
                  errors.append({"file_path": track.file_path, "error": "Could not generate embedding string"})
                  continue
 
 
-            embedding = model.encode(tags_for_embedding).tolist()
-
-            # Collect data for batch adding (if implementing batch add)
-            # batch_embeddings.append(embedding)
-            # batch_metadatas.append(track.metadata)
-            # batch_ids.append(track.file_path)
-
-            # For sequential processing, add immediately
-            collection.add(
-                embeddings=[embedding],
-                metadatas=[track.metadata],
-                ids=[track.file_path]
+            tracks_to_add.append(
+                Track(
+                    file_path=track.file_path,
+                    metadata={**track.metadata, "_embedding_text": tags_for_embedding},
+                )
             )
 
             if not exists:
                 added_count += 1
 
         except Exception as e:
-            log.error(f"Error processing track '{track.file_path}' in batch: {e}")
+            log.error("`state` Error processing track '%s' in batch: %s", track.file_path, e)
             errors.append({"file_path": track.file_path, "error": str(e)})
 
-    # If implementing batch add and delete:
-    # if tracks_to_delete:
-    #     collection.delete(ids=tracks_to_delete)
-    # if batch_ids:
-    #     collection.add(embeddings=batch_embeddings, metadatas=batch_metadatas, ids=batch_ids)
+    try:
+        embeddings: list[list[float]] = []
+        if tracks_to_add:
+            embedding_texts = [track.metadata.pop("_embedding_text") for track in tracks_to_add]
+            embeddings = _generate_embeddings(embedding_texts, "passage")
+
+        if tracks_to_delete:
+            collection.delete(ids=tracks_to_delete)
+
+        if tracks_to_add:
+            collection.add(
+                embeddings=embeddings,
+                metadatas=[track.metadata for track in tracks_to_add],
+                ids=[track.file_path for track in tracks_to_add],
+            )
+    except Exception as e:
+        log.error("`state` Error committing batch operation: %s", e)
+        errors.append({"file_path": "<batch>", "error": str(e)})
 
     message = f"Batch process finished: Added {added_count} new tracks, updated {updated_count} existing tracks, skipped {skipped_count} tracks."
     if errors:
@@ -350,14 +439,14 @@ async def list_tracks():
     Returns:
     - **tracks**: List of file paths
     """
-    log.info("Listing all tracks")
+    log.info("`api` Listing all tracks")
 
     try:
         # Fetch only IDs to be efficient
         all_tracks = collection.get(include=[])
         return {"tracks": all_tracks["ids"]}
     except Exception as e:
-        log.error(f"Error listing tracks: {e}")
+        log.error("`state` Error listing tracks: %s", e)
         raise HTTPException(status_code=500, detail=f"Error listing tracks: {e}")
 
 
@@ -372,7 +461,7 @@ async def health_check():
     Returns:
     - **status**: Server status message
     """
-    log.info("Health check requested")
+    log.info("`api` Health check requested")
 
     # You could add checks for ChromaDB connection here
     try:
@@ -381,22 +470,27 @@ async def health_check():
     except Exception:
         chromadb_status = "error"
 
-    return {"status": "Server is running", "chromadb": chromadb_status}
+    try:
+        embeddings_health = _get_embeddings_health()
+        embeddings_status = "ok"
+        embedding_model = embeddings_health.get("model")
+    except EmbeddingsServiceError:
+        embeddings_status = "error"
+        embedding_model = None
+
+    return {
+        "status": "Server is running",
+        "chromadb": chromadb_status,
+        "embeddings": embeddings_status,
+        "embedding_model": embedding_model,
+    }
 
 
 # New endpoint for searching tracks by tag string with metadata filtering
 @lru_cache(maxsize=1000)
-def _generate_embedding(tags: str) -> list[float]:
-    """Generates embedding for a given tag string using the SentenceTransformer model."""
-    # Add error handling for encoding
-    try:
-        return model.encode(tags).tolist()
-    except Exception as e:
-        log.error(f"Error generating embedding for tags '{tags}': {e}")
-        # Return a zero vector or raise an error depending on desired behavior
-        # Returning a zero vector might affect search results, raising an error
-        # would prevent the search. Let's raise an error for clarity.
-        raise RuntimeError(f"Failed to generate embedding: {e}")
+def _get_cached_query_embedding(tags: str) -> list[float]:
+    """Caches query embeddings to reduce repeated remote calls."""
+    return _generate_embedding(tags, "query")
 
 
 class SearchParams(BaseModel):
@@ -438,9 +532,9 @@ def _fuzzy_match(query: str, choices: List[str], threshold: int = 80) -> Optiona
     # Use extractOne for the single best match
     match = process.extractOne(query, choices, scorer=fuzz.WRatio)
     if match and match[1] >= threshold:
-        log.debug(f"Fuzzy match found for '{query}': '{match[0]}' with score {match[1]}")
+        log.debug("`state` Fuzzy match found for '%s': '%s' with score %s", query, match[0], match[1])
         return match[0]
-    log.debug(f"No fuzzy match found for '{query}' above threshold {threshold}")
+    log.debug("`state` No fuzzy match found for '%s' above threshold %s", query, threshold)
     return None
 
 
@@ -468,7 +562,7 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
     - 422: Validation error
     - 500: Internal server error
     """
-    log.debug(f"Search query params: {params}")
+    log.debug("`api` Search query params: %s", params)
 
     # Build the where clause for metadata filtering with fuzzy matching
     where_clause = {}
@@ -478,12 +572,12 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
         matched_artist = _fuzzy_match(params.artist, unique_artists)
         if matched_artist:
             where_clause["artist"] = matched_artist
-            log.info(f"Using fuzzy matched artist: '{matched_artist}' for search.")
+            log.info("`api` Using fuzzy matched artist: '%s' for search.", matched_artist)
         else:
             # If no fuzzy match, use the original query or skip filter
             # For now, let's use the original query for exact match attempt by ChromaDB
             where_clause["artist"] = params.artist
-            log.info(f"No fuzzy match for artist '{params.artist}', attempting exact match.")
+            log.info("`api` No fuzzy match for artist '%s', attempting exact match.", params.artist)
 
     if params.album is not None:
         # Get unique album names and perform fuzzy matching
@@ -491,11 +585,11 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
         matched_album = _fuzzy_match(params.album, unique_albums)
         if matched_album:
             where_clause["album"] = matched_album
-            log.info(f"Using fuzzy matched album: '{matched_album}' for search.")
+            log.info("`api` Using fuzzy matched album: '%s' for search.", matched_album)
         else:
             # If no fuzzy match, use the original query
             where_clause["album"] = params.album
-            log.info(f"No fuzzy match for album '{params.album}', attempting exact match.")
+            log.info("`api` No fuzzy match for album '%s', attempting exact match.", params.album)
 
     # Add other metadata filters here as needed
 
@@ -503,7 +597,7 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
     try:
         if params.tags:
             # Semantic search with optional metadata filtering
-            embedding = _generate_embedding(params.tags)
+            embedding = _get_cached_query_embedding(params.tags)
             raw_results = collection.query(
                 query_embeddings=[embedding],
                 n_results=min(params.limit * 5, 100), # Request more results to filter by distance and metadata
@@ -541,7 +635,7 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
             # No tags and no metadata filters
             raise HTTPException(status_code=400, detail="Either 'tags' or at least one metadata filter must be provided.")
 
-        log.info(f"Raw search results count: {len(results_ids)}")
+        log.info("`api` Raw search results count: %s", len(results_ids))
         # log.debug(f"Raw search results: {pretty_repr(raw_results)}") # Avoid logging potentially large raw_results
 
         # Filter results by distance if semantic search was performed
@@ -568,20 +662,21 @@ async def search_tracks(params: SearchParams = Depends()): # Use Depends to inje
 
         return filtered_results
 
-    except RuntimeError as e:
+    except EmbeddingsServiceError as e:
         # Handle errors from embedding generation
-        log.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+        log.error("`http` Search failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"Search failed: {e}")
     except Exception as e:
-        log.error(f"An unexpected error occurred during search: {e}")
+        log.error("`state` An unexpected error occurred during search: %s", e)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
 @app.delete("/clear_collection/",
     response_model=dict,
     summary="Clear collection",
-    response_description="Collection clearing status")
-async def clear_collection():
+    response_description="Collection clearing status",
+    include_in_schema=False)
+async def clear_collection(confirm: bool = Query(False, description="Explicitly confirm collection deletion")):
     """
     Delete all tracks from the collection.
 
@@ -590,9 +685,15 @@ async def clear_collection():
     Returns:
     - **message**: Summary of deleted tracks
     """
-    log.info("Clearing entire collection")
+    log.info("`api` Clearing entire collection")
 
     global collection
+
+    if not getattr(getattr(cfg, "admin", object()), "clear_collection_enabled", False):
+        raise HTTPException(status_code=403, detail="clear_collection is disabled by configuration")
+
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to clear the collection")
 
     try:
         # Get current count of tracks before deletion attempt
@@ -600,30 +701,30 @@ async def clear_collection():
             # Use the client to count directly
             count = client.get_collection(cfg.chromadb.collection_name).count()
         except Exception as e: # Collection might not exist or other error
-            log.warning(f"Could not get collection count: {e}")
+            log.warning("`state` Could not get collection count: %s", e)
             # Attempt to delete anyway, in case the error was not about non-existence
-            pass # Continue to deletion attempt
+            count = 0
 
         # Delete the collection and recreate it
         try:
             client.delete_collection(cfg.chromadb.collection_name)
             # Recreate the collection immediately after deletion
             collection = client.create_collection(cfg.chromadb.collection_name)
-            log.info(f"Cleared collection '{cfg.chromadb.collection_name}', deleted {count} tracks (approximate count before deletion).")
+            log.info("`state` Cleared collection '%s', deleted %s tracks (approximate count before deletion).", cfg.chromadb.collection_name, count)
             return {"message": f"Collection cleared, {count} tracks deleted (approximate count before deletion)."}
         except Exception as e:
-             log.error(f"Error deleting or recreating collection: {e}")
-             # If deletion/recreation fails, try to get the count again for the error message
-             try:
-                 current_count = client.get_collection(cfg.chromadb.collection_name).count()
-                 error_msg = f"Error clearing collection. Current track count: {current_count}. Error: {e}"
-             except:
-                 error_msg = f"Error clearing collection. Could not get current track count. Error: {e}"
-             raise HTTPException(status_code=500, detail=error_msg)
+            log.error("`state` Error deleting or recreating collection: %s", e)
+            # If deletion/recreation fails, try to get the count again for the error message
+            try:
+                current_count = client.get_collection(cfg.chromadb.collection_name).count()
+                error_msg = f"Error clearing collection. Current track count: {current_count}. Error: {e}"
+            except Exception:
+                error_msg = f"Error clearing collection. Could not get current track count. Error: {e}"
+            raise HTTPException(status_code=500, detail=error_msg)
 
 
     except Exception as e:
-        log.error(f"An unexpected error occurred during clear_collection: {e}")
+        log.error("`state` An unexpected error occurred during clear_collection: %s", e)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
@@ -659,11 +760,9 @@ async def collection_stats():
     }
     ```
     """
-    log.info("Getting collection statistics")
+    log.info("`metrics` Getting collection statistics")
 
     try:
-        # Get all tracks with metadata (embeddings are not needed for stats calculation)
-        # Fetch a limited number of embeddings to get dimension, or get count first
         count = collection.count()
 
         if count == 0:
@@ -698,19 +797,15 @@ async def collection_stats():
             # Assuming float32 (4 bytes)
             embedding_size = embedding_dimension * 4 * total_tracks / (1024 * 1024)  # Convert to MB
         else:
-            log.warning("No embeddings found in sample to calculate size and dimension.")
+            log.warning("`metrics` No embeddings found in sample to calculate size and dimension.")
 
 
-        # Analyze metadata fields from the sample (approximation)
         metadata_fields = {}
         metadatas = sample_results.get("metadatas", [])
 
-        # For more accurate metadata stats, you might need to iterate through all metadatas
-        # or use aggregation features if ChromaDB supports them efficiently.
-        # This sample-based approach gives an estimate.
         if metadatas is not None:
             for metadata in metadatas:
-                if metadata: # Ensure metadata is not None or empty
+                if metadata:
                     for key, value in metadata.items():
                         if key not in metadata_fields:
                             metadata_fields[key] = {
@@ -719,21 +814,16 @@ async def collection_stats():
                                 "types": set()
                             }
                         metadata_fields[key]["count"] += 1
-                        # Convert value to string for unique values set to avoid type issues
-                    metadata_fields[key]["unique_values"].add(str(value))
-                    metadata_fields[key]["types"].add(type(value).__name__)
+                        metadata_fields[key]["unique_values"].add(str(value))
+                        metadata_fields[key]["types"].add(type(value).__name__)
 
-        # Convert sets to lists for JSON serialization
         metadata_stats = {}
-        # Note: counts and unique values will be based on the sample, not the full collection
         for key, stats in metadata_fields.items():
             metadata_stats[key] = {
-                "sample_count": stats["count"], # Renamed to indicate it's from sample
-                # coverage_percent based on sample might be misleading
+                "sample_count": stats["count"],
                 "unique_values_in_sample": len(stats["unique_values"]),
                 "types": list(stats["types"])
             }
-        # Add a note about sample-based metadata stats
         metadata_stats["_note"] = "Metadata stats are based on a sample of 10 tracks for performance. For full stats, a more extensive process is needed."
 
 
@@ -746,7 +836,7 @@ async def collection_stats():
         }
 
     except Exception as e:
-        log.error(f"Error getting collection stats: {e}")
+        log.error("`metrics` Error getting collection stats: %s", e)
         raise HTTPException(status_code=500, detail=f"Error getting collection stats: {e}")
 
 
@@ -760,7 +850,7 @@ def _get_unique_metadata_values(key: str) -> List[Any]:
     Returns:
     - List of unique metadata values.
     """
-    log.info(f"Getting unique values for metadata key: {key}")
+    log.info("`api` Getting unique values for metadata key: %s", key)
 
     try:
         # Fetch all tracks, including only the specified metadata key
@@ -793,11 +883,11 @@ def _get_unique_metadata_values(key: str) -> List[Any]:
         # Convert set to list and sort for consistent output
         sorted_values = sorted(list(unique_values), key=str) # Sort by string representation
 
-        log.info(f"Found {len(sorted_values)} unique values for key '{key}'.")
+        log.info("`api` Found %s unique values for key '%s'.", len(sorted_values), key)
         return sorted_values
 
     except Exception as e:
-        log.error(f"Error getting metadata list for key '{key}': {e}")
+        log.error("`api` Error getting metadata list for key '%s': %s", key, e)
         # Re-raise the exception to be handled by the calling function
         raise
 
@@ -828,28 +918,112 @@ async def get_metadata_list(key: str = Query(..., description="Metadata key (e.g
         raise HTTPException(status_code=500, detail=f"Error getting metadata list: {e}")
 
 
-def _init_logs():
-    """Initializes logging configuration."""
-    # Add checks if cfg.logging and its sub-attributes exist
-    if hasattr(cfg, 'logging'):
-        if hasattr(cfg.logging, 'loggers') and hasattr(cfg.logging.loggers, 'suppress'):
-            for logger_name in cfg.logging.loggers.suppress:
-                if hasattr(cfg.logging.loggers, 'suppress_level'):
-                     level = getattr(logging, cfg.logging.loggers.suppress_level.upper(), logging.WARNING)
-                     logging.getLogger(logger_name).setLevel(level)
-                else:
-                     logging.getLogger(logger_name).setLevel(logging.WARNING) # Default suppress level
+def _default_logging_config() -> dict[str, Any]:
+    return {
+        "level": "INFO",
+        "console": True,
+        "file_enabled": False,
+        "file": "logs/music2db-server.log",
+        "show_time": True,
+        "time_format": "%H:%M:%S",
+        "show_level": False,
+        "show_path": False,
+        "logs_width": 140,
+        "tags_width": 16,
+        "tag_filter_mode": "any",
+        "unknown_tags": "hide",
+        "show_all_tags_errors": True,
+        "show_all_tags_warnings": True,
+        "level_decor": {
+            "notset": {"symbol": "█"},
+            "debug": {"symbol": "█"},
+            "info": {"symbol": "█"},
+            "warning": {"symbol": "█"},
+            "error": {"symbol": "█"},
+            "critical": {"symbol": "█"},
+        },
+        "loggers": {
+            "uvicorn": "WARNING",
+            "uvicorn.error": "WARNING",
+            "uvicorn.access": "WARNING",
+            "starlette": "WARNING",
+            "fastapi": "WARNING",
+            "httpx": "WARNING",
+            "httpcore": "WARNING",
+            "urllib3.connectionpool": "WARNING",
+        },
+        "tags": {
+            "startup": {"show": True, "icon": "S", "tag_color": "#5f875f", "icon_color": "#ffffff"},
+            "config": {"show": True, "icon": "cfg", "tag_color": "#5f5f87", "icon_color": "#ffffff"},
+            "api": {"show": True, "icon": "api", "tag_color": "#005f87", "icon_color": "#ffffff"},
+            "http": {"show": False, "icon": "http", "tag_color": "#444444", "icon_color": "#ffffff"},
+            "metrics": {"show": False, "icon": "M", "tag_color": "#008787", "icon_color": "#ffffff"},
+            "state": {"show": True, "icon": "st", "tag_color": "#875f00", "icon_color": "#ffffff"},
+        },
+    }
 
-        if hasattr(cfg.logging, 'level'):
-             parent_logger.setLevel(getattr(logging, cfg.logging.level.upper(), logging.INFO)) # Default parent level
-             if cfg.logging.level.upper() == "DEBUG":
-                 cfg.print_config()
+
+def _config_search_dirs() -> list[Path]:
+    return [SYSTEM_CONFIG_DIR, XDG_CONFIG_DIR, LOCAL_CONFIG_DIR]
+
+
+def _discover_config_files(filename: str) -> list[str]:
+    return [str(path / filename) for path in _config_search_dirs() if (path / filename).exists()]
+
+
+def _resolve_logging_config_file() -> Path | None:
+    explicit_path = getattr(getattr(cfg, "app", object()), "logging_config", None)
+    if explicit_path:
+        return Path(str(explicit_path)).expanduser()
+
+    for config_file in reversed(ACTIVE_CONFIG_FILES):
+        logging_path = config_file.parent / "logging.yaml"
+        if logging_path.exists():
+            return logging_path
+
+    for candidate in reversed(_config_search_dirs()):
+        logging_path = candidate / "logging.yaml"
+        if logging_path.exists():
+            return logging_path
+
+    return None
+
+
+def _merge_logging_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_logging_config(merged[key], value)
         else:
-             parent_logger.setLevel(logging.INFO) # Default parent level
-    else:
-         # Default logging if no config is found
-         parent_logger.setLevel(logging.INFO)
-         logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="%X", handlers=[RichHandler(console=Console(), markup=True)])
+            merged[key] = value
+    return merged
+
+
+def _load_logging_config() -> dict[str, Any]:
+    config = _default_logging_config()
+    logging_path = _resolve_logging_config_file()
+
+    if logging_path and logging_path.exists():
+        import yaml
+
+        with logging_path.open("r", encoding="utf-8") as file:
+            loaded = yaml.safe_load(file) or {}
+        config = _merge_logging_config(config, loaded)
+
+    return config
+
+
+def _init_logs() -> None:
+    """Initializes logging configuration."""
+    logging_config = _load_logging_config()
+    setup_logging(logging_config)
+    log.info(
+        "`config` Logging configured from %s",
+        str(_resolve_logging_config_file() or "<defaults>"),
+    )
+
+    if str(logging_config.get("level", "INFO")).upper() == "DEBUG":
+        log.debug("`config` Active config files: %s", [str(path) for path in ACTIVE_CONFIG_FILES])
 
 
 def _parse_args():
@@ -859,7 +1033,7 @@ def _parse_args():
         "-c",
         "--config",
         dest="config_file",
-        default=DEFAULT_CONFIG_FILE,
+        default=None,
         help="Configuration file location.",
     )
     return parser.parse_known_args()
@@ -873,8 +1047,16 @@ def _init_config(files: list[str], unknown_args: list[str]):
         files (List[str]): List of config files.
         unknown_args (List[str]): List of arguments (unknown for argparse).
     """
+    global ACTIVE_CONFIG_FILES
+    ACTIVE_CONFIG_FILES = [Path(file).expanduser() for file in files]
     cfg.load_files(files)
     cfg.load_args(unknown_args)
+
+
+def _resolve_config_files(config_file: str | None) -> list[str]:
+    if config_file:
+        return [str(Path(config_file).expanduser())]
+    return _discover_config_files("config.yaml")
 
     # # add some/override config here if needed
     # cfg.update('runtime.blablabla', True)
@@ -884,24 +1066,27 @@ def _init_config(files: list[str], unknown_args: list[str]):
 def main():
     """Main function to initialize and run the FastAPI application."""
     args, unknown_args = _parse_args()
-    _init_config([args.config_file], unknown_args)
+    config_files = _resolve_config_files(args.config_file)
+    _init_config(config_files, unknown_args)
     _init_logs() # Initialize logs after config is loaded
     _init_entities() # Initialize entities after config and logs
 
-    log.info(f"Starting {APP_NAME}")
+    log.info("`startup` Starting %s", APP_NAME)
     # Use the 'app' instance that was initialized first
     # Add a check if cfg.app, cfg.app.host, and cfg.app.port exist
     if not hasattr(cfg, 'app') or not hasattr(cfg.app, 'host') or not hasattr(cfg.app, 'port'):
-         log.error("App host or port configuration missing in config.yaml")
+         log.error("`config` App host or port configuration missing in config.yaml")
          sys.exit(1)
 
-    uvicorn.run(app, 
-                host=cfg.app.host, 
-                port=cfg.app.port, 
-                log_level=cfg.logging.loggers.suppress_level.lower())
+    uvicorn.run(
+        app,
+        host=cfg.app.host,
+        port=cfg.app.port,
+        log_level=str(_load_logging_config().get("loggers", {}).get("uvicorn", "warning")).lower(),
+    )
 
 
 # Run server
 if __name__ == "__main__":
-    log.info(f"Starting {APP_NAME}")
+    log.info("`startup` Starting %s", APP_NAME)
     sys.exit(main())

@@ -8,15 +8,21 @@ authors = [
     { name = "Music2DB Server Contributors" }
 ]
 dependencies = [
+    "cyberlog>=0.2.1",
     "chromadb-client>=0.6.3",
     "dotenv>=0.9.9",
     "fastapi>=0.115.11",
+    "httpx>=0.28.1",
     "kimiconfig>=0.2.7",
+    "pyyaml>=6.0",
     "rich>=13.9.4",
-    "sentence-transformers>=3.4.1",
-    "torch",
     "uvicorn>=0.34.0",
     "rapidfuzz>=3.9.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.5",
 ]
 
 [project.scripts]
@@ -34,9 +40,16 @@ package-dir = {"" = "src"}
 version = {attr = "music2db_server.__version__"}
 
 [tool.uv]
-index = [
-    { url = "http://kimihome.lan:58080/simple/" },
-]
+allow-insecure-host = ["kimihome.lan:58080"]
 
 [tool.uv.sources]
+cyberlog = { index = "kimihome" }
 torch = { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp310-cp310-linux_x86_64.whl" }
+
+[[tool.uv.index]]
+name = "kimihome"
+url = "http://kimihome.lan:58080/simple"
+explicit = true
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

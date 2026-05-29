@@ -11,7 +11,11 @@ mkdir -p ~/.config/music2db_server
 
 # Copy default config if it doesn't exist
 if [ ! -f ~/.config/music2db_server/config.yaml ]; then
-    cp config.yaml ~/.config/music2db_server/
+    cp config/config.yaml ~/.config/music2db_server/config.yaml
+fi
+
+if [ ! -f ~/.config/music2db_server/logging.yaml ]; then
+    cp config/logging.yaml ~/.config/music2db_server/logging.yaml
 fi
 
 # Install systemd service

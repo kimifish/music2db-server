@@ -1,0 +1,40 @@
+level: INFO
+console: true
+file_enabled: false
+file: logs/music2db-server.log
+show_time: true
+time_format: "%H:%M:%S"
+show_level: false
+show_path: false
+logs_width: 140
+tags_width: 16
+tag_filter_mode: any
+unknown_tags: hide
+show_all_tags_errors: true
+show_all_tags_warnings: true
+
+level_decor:
+  notset: { symbol: "█" }
+  debug: { symbol: "█" }
+  info: { symbol: "█" }
+  warning: { symbol: "█" }
+  error: { symbol: "█" }
+  critical: { symbol: "█" }
+
+loggers:
+  uvicorn: WARNING
+  uvicorn.error: WARNING
+  uvicorn.access: WARNING
+  starlette: WARNING
+  fastapi: WARNING
+  httpx: WARNING
+  httpcore: WARNING
+  urllib3.connectionpool: WARNING
+
+tags:
+  startup: { show: true, icon: "S", tag_color: "#5f875f", icon_color: "#ffffff" }
+  config: { show: true, icon: "cfg", tag_color: "#5f5f87", icon_color: "#ffffff" }
+  api: { show: true, icon: "api", tag_color: "#005f87", icon_color: "#ffffff" }
+  http: { show: false, icon: "http", tag_color: "#444444", icon_color: "#ffffff" }
+  metrics: { show: false, icon: "M", tag_color: "#008787", icon_color: "#ffffff" }
+  state: { show: true, icon: "st", tag_color: "#875f00", icon_color: "#ffffff" }
