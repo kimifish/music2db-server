@@ -106,6 +106,80 @@ def test_clear_collection_is_hidden_and_forbidden_when_disabled(monkeypatch):
     assert response.json()["detail"] == "clear_collection is disabled by configuration"
 
 
+def test_delete_track_deletes_existing_track(monkeypatch):
+    class FakeCollection:
+        def __init__(self):
+            self.deleted_ids = None
+
+        def get(self, ids, include):
+            assert ids == ["Artist/Album/Track.mp3"]
+            assert include == []
+            return {"ids": ids}
+
+        def delete(self, ids):
+            self.deleted_ids = ids
+
+    fake_collection = FakeCollection()
+    monkeypatch.setattr(server, "collection", fake_collection, raising=False)
+
+    client = TestClient(server.app)
+    response = client.delete("/delete_track/", params={"file_path": "Artist/Album/Track.mp3"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "message": "Track 'Artist/Album/Track.mp3' deleted successfully",
+        "file_path": "Artist/Album/Track.mp3",
+        "deleted": True,
+    }
+    assert fake_collection.deleted_ids == ["Artist/Album/Track.mp3"]
+
+
+def test_delete_track_is_idempotent_for_missing_track(monkeypatch):
+    class FakeCollection:
+        def __init__(self):
+            self.delete_called = False
+
+        def get(self, ids, include):
+            return {"ids": []}
+
+        def delete(self, ids):
+            self.delete_called = True
+
+    fake_collection = FakeCollection()
+    monkeypatch.setattr(server, "collection", fake_collection, raising=False)
+
+    client = TestClient(server.app)
+    response = client.delete("/delete_track/", params={"file_path": "missing.mp3"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "message": "Track 'missing.mp3' was not found",
+        "file_path": "missing.mp3",
+        "deleted": False,
+    }
+    assert fake_collection.delete_called is False
+
+
+def test_delete_track_returns_500_for_collection_error(monkeypatch):
+    class FakeCollection:
+        def get(self, ids, include):
+            raise RuntimeError("chromadb failed")
+
+    monkeypatch.setattr(server, "collection", FakeCollection(), raising=False)
+
+    client = TestClient(server.app)
+    response = client.delete("/delete_track/", params={"file_path": "broken.mp3"})
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Error deleting track: chromadb failed"
+
+
+def test_delete_track_is_in_openapi(monkeypatch):
+    client = TestClient(server.app)
+
+    assert "/delete_track/" in client.get("/openapi.json").json()["paths"]
+
+
 def test_collection_stats_collects_all_metadata_fields(monkeypatch):
     class FakeCollection:
         def count(self):

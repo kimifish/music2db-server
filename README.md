@@ -1,7 +1,7 @@
 
 # Music2DB Server
 
-Version: 0.3.3
+Version: 0.3.4
 
 A FastAPI-based server that provides embedding-based music track indexing and similarity search using ChromaDB and an external embeddings service.
 
@@ -156,8 +156,11 @@ Logging is loaded with the same precedence from `logging.yaml` in `/etc/music2db
         ```
 
     - `GET /list_tracks/`: List all tracked files
+    - `DELETE /delete_track/?file_path=...`: Delete one tracked file by its `file_path` ID; already absent tracks return success with `deleted: false`
     - `GET /health/`: Server health check
     - `DELETE /clear_collection/?confirm=true`: Hidden maintenance endpoint, available only when `admin.clear_collection_enabled=true`
+
+    Clients can use `GET /list_tracks/` to compare indexed IDs with local files and call `DELETE /delete_track/` for files that were removed, moved, or renamed locally.
 
 ## Development
 

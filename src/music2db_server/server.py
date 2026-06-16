@@ -359,6 +359,41 @@ async def list_tracks():
         raise HTTPException(status_code=500, detail=f"Error listing tracks: {e}")
 
 
+@app.delete("/delete_track/",
+    response_model=dict,
+    summary="Delete a single track",
+    response_description="Track deletion status")
+async def delete_track(file_path: str = Query(..., description="Track file_path used as the ChromaDB ID")):
+    """
+    Delete a single track from the collection by its file_path ID.
+
+    This endpoint is idempotent: deleting an already absent track returns success
+    with deleted=false so clients can safely sync removed local files.
+    """
+    log.info("`api` Deleting track: %s", file_path)
+
+    try:
+        existing = collection.get(ids=[file_path], include=[])
+        if not existing.get("ids"):
+            log.info("`state` Track '%s' not found for deletion.", file_path)
+            return {
+                "message": f"Track '{file_path}' was not found",
+                "file_path": file_path,
+                "deleted": False,
+            }
+
+        collection.delete(ids=[file_path])
+        log.info("`state` Track '%s' deleted successfully.", file_path)
+        return {
+            "message": f"Track '{file_path}' deleted successfully",
+            "file_path": file_path,
+            "deleted": True,
+        }
+    except Exception as e:
+        log.error("`state` Error deleting track '%s': %s", file_path, e)
+        raise HTTPException(status_code=500, detail=f"Error deleting track: {e}")
+
+
 @app.get("/health/",
     response_model=dict,
     summary="Health check",
